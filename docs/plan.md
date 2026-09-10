@@ -18,7 +18,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 | 0 — scaffold, spec, seams | `main` | seven tasks validate; gate green; corpus verified | done |
 | 1 — terminal | `feat/terminal` | the four abuses below | open |
 | 2 — detector | `feat/detector` | 27 corpus cases green | done |
-| 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | open |
+| 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
 
 **1 and 2 are parallel.** They share no file. 3 needs only `detector`'s
@@ -139,9 +139,22 @@ well under the 200 ms tick with room to spare. It runs on every read.
 
 ---
 
-## Phase 3 — the engine
+## Phase 3 — the engine — **done**
 
-`engine.rs`. Spec §5, §8–§11. Decisions D8. Needs `detector`'s signature only.
+`engine.rs`, `events.rs`. Spec §5, §8–§11. Decision D8. Built on `feat/engine`.
+
+24 tests, 0.01 s, gate green — I1–I11 plus the key table, the two status texts,
+the watchdog's rescue and its cooldown, and the exit codes. Nothing sleeps.
+
+Two things came out of writing it:
+
+- **`Action::Forward`** was missing from architecture.md. A forwarded keystroke
+  and an answer are both PTY writes, but only one counts, and §9's "consumed
+  keys are never forwarded" is unassertable without the distinction.
+- **`last_rescue` is an `Option`.** Seeding it with the start time claims a
+  rescue that never happened and holds the first real one off for the 3 s
+  cooldown instead of the 2 s idle threshold. cry-aye gets this right by
+  accident — Go's zero `time.Time` is far enough in the past to always pass.
 
 `handle(&mut self, event: Event) -> Vec<Action>`. No I/O, no clock, no threads.
 Tests construct an engine, feed events with invented instants, assert on the

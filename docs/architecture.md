@@ -122,16 +122,23 @@ pub enum Event {
     Tick(Instant),
     /// The PTY write for an answer failed. §13 I8.
     AnswerFailed(Instant),
-    Winch,
+    Winch(Instant),
     Terminate(i32),
     Eof,
 }
 
-pub fn spawn(pty: &Pty) -> Receiver<Event>;
+pub fn spawn(pty: &Pty) -> Receiver<Event>;   // phase 1
 ```
 
-`Instant::now()` lives here and in no other file (D8). A reviewer should be
-able to `grep -rn 'Instant::now' src/` and see exactly one file.
+**The enum landed with phase 3, `spawn` lands with phase 1.** The engine is the
+only consumer and had to be buildable before a PTY existed. `Winch` carries an
+instant because the engine redraws the bar on it, and the bar's contents are
+time-dependent.
+
+`Instant::now()` lives here and in no other *non-test* file (D8). A reviewer
+running `grep -rn 'Instant::now' src/` sees `events.rs`, plus a single origin
+helper in `engine.rs`'s test module — every instant in a test is arithmetic on
+that origin, so nothing waits on anything.
 
 ### `engine.rs` — phase 3, depends on `detector.rs` only
 
@@ -139,6 +146,8 @@ able to `grep -rn 'Instant::now' src/` and see exactly one file.
 pub enum Action {
     /// Write these bytes to the PTY. `yes\r` or `\r`, one write. §8.
     Answer(Vec<u8>),
+    /// Write the user's own keystrokes to the PTY, verbatim. §9.
+    Forward(Vec<u8>),
     Status { text: String, colour: &'static str },
     ForceRedraw,
     Exit(u8),
@@ -149,8 +158,14 @@ pub struct Engine { /* buffer, watermark, countdown, auto_approve, counts */ }
 impl Engine {
     pub fn new(delay: u8, started: Instant) -> Self;
     pub fn handle(&mut self, event: Event) -> Vec<Action>;
+    pub fn approvals(&self) -> u32;
 }
 ```
+
+`Forward` was missing from the first draft of this file. Forwarding a keystroke
+is a PTY write like an answer is, but only one of the two counts as an approval
+or raises a flash, and a test that cannot tell them apart cannot assert §9's
+"consumed keys are never forwarded".
 
 `main` performs the actions in order. An `Answer` whose write fails comes back
 as `Event::AnswerFailed` on the next turn of the loop — that is the round trip
