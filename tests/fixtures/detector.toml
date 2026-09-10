@@ -1,0 +1,199 @@
+# The detector corpus — spec §6's actual contract, as data (D9).
+#
+# Ported case-for-case from cry-aye's cmd/cry-aye/detector_test.go and the
+# plain-text cases in wrapper_test.go. The Rust tests are a loop over this
+# file; adding a captured dialog means adding an entry here, not writing a
+# test.
+#
+# ESC is \u001B. Multi-line strings drop the newline right after the opening
+# delimiter, so what is written is exactly what the Go raw string held.
+
+# ── is_prompt -> true ────────────────────────────────────────────────────────
+# `min_score` is a floor, not an equality: adding an indicator to §6's table
+# must not break a case that already passes.
+
+[[dialog]]
+name = "standard file creation"
+min_score = 5
+input = """
+Do you want to create a new file?
+
+1. Yes
+2. No
+
+Esc to cancel | Enter to approve"""
+
+[[dialog]]
+name = "permission rule header"
+min_score = 6
+input = """
+Permission rule
+
+Do you want to proceed with this action?
+
+1. Yes
+2. No
+
+Enter to approve | Esc to cancel"""
+
+[[dialog]]
+name = "simple y/n, no buttons"
+min_score = 3
+input = "Type 'yes' to continue (y/n)"
+
+[[dialog]]
+name = "file edit with a third option and Tab"
+min_score = 7
+input = """
+Do you want to edit main.go?
+
+1. Yes
+2. No
+3. View details
+
+Tab to amend | Esc to cancel | Enter to approve"""
+
+[[dialog]]
+name = "bash permission, Enter to confirm"
+min_score = 3
+input = """
+Allow running bash command?
+
+Enter to confirm | Esc to cancel"""
+
+# The current Claude Code shape: a selection caret, middot separators, and a
+# hint line that carries ctrl+e. If detection ever regresses, this is the case
+# that catches it first.
+[[dialog]]
+name = "bash permission, current hint format with ctrl+e"
+min_score = 9
+input = """
+ Bash command
+
+   ls -la /some/path/ | head -30
+   Run shell command
+
+ Permission rule Bash requires confirmation for this command.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain"""
+
+# A whole buffer as it arrives off the PTY — screen clear, colour, bold, the
+# lot. Proves the strip runs before the score and not beside it.
+[[dialog]]
+name = "real-world buffer with ANSI"
+min_score = 6
+input = "\u001B[2J\u001B[H\u001B[32mClaude:\u001B[0m I'll help you create that file.\n\nPermission rule\n\nDo you want to \u001B[1mcreate\u001B[0m the file \u001B[33mmain.go\u001B[0m?\n\n\u001B[36m1. Yes\u001B[0m\n\u001B[36m2. No\u001B[0m\n\n\u001B[90mEsc to cancel\u001B[0m | \u001B[32mEnter to approve\u001B[0m"
+
+# The loop harness's canonical dialog (spec §14). Every phase-3 test injects
+# this exact string; it lives here so the two suites cannot drift.
+[[dialog]]
+name = "loop harness canonical"
+min_score = 10
+input = " 1. Yes\n 2. No\n Enter to approve \n Esc to cancel\n"
+
+# ── is_prompt -> false ───────────────────────────────────────────────────────
+
+[[not_dialog]]
+name = "regular conversation"
+input = "Here's how to implement the feature. Do you want me to explain more?"
+
+[[not_dialog]]
+name = "documentation describing a prompt"
+input = 'The system will ask "Do you want to proceed?" with options Yes/No.'
+
+[[not_dialog]]
+name = "question without any UI furniture"
+input = "Do you want to create a file? Yes or No?"
+
+[[not_dialog]]
+name = "fenced code, no dialog in it"
+input = "Here is the code:\n```go\nfunc foo() {}\n```\n"
+
+[[not_dialog]]
+name = "comment lines"
+input = "// This is a comment\n// with multiple lines\n"
+
+[[not_dialog]]
+name = "package manager output"
+input = "Running: npm install\nfetching packages...\ndone\n"
+
+# ── is_prompt -> true, and that is the hazard (spec §6) ──────────────────────
+# A quoted dialog scores like a real one. These cases exist to PIN that
+# behaviour, not to lament it: nothing in the byte stream tells a dialog Claude
+# is showing from one Claude is quoting. A change that makes these stop
+# detecting is a regression, not a fix — read §6 before touching it.
+
+[[quoted_dialog]]
+name = "unclosed fence, dialog inside"
+input = "```\nDo you want to proceed?\n1. Yes\n2. No\nEnter to approve"
+
+[[quoted_dialog]]
+name = "closed fence, dialog after it"
+input = "```\ncode here\n```\n\nDo you want to proceed?\n1. Yes\n2. No\nEnter to approve"
+
+[[quoted_dialog]]
+name = "two closed fences, dialog after them"
+input = "```\nblock1\n```\n```\nblock2\n```\n\nDo you want to proceed?\n1. Yes\n2. No\nEnter to approve"
+
+# ── strip_ansi ───────────────────────────────────────────────────────────────
+# Compared after trimming both ends, as in Go: the strip leaves edge whitespace
+# where escapes were, and the score does not care.
+
+[[strip]]
+name = "colour codes removed"
+input = "\u001B[32mGreen text\u001B[0m"
+want = "Green text"
+
+[[strip]]
+name = "cursor movement becomes a space"
+input = "Text\u001B[2AMore text"
+want = "Text More text"
+
+[[strip]]
+name = "clear-screen and home are cursor moves too"
+input = "\u001B[1;31mBold Red\u001B[0m\u001B[2J\u001B[H"
+want = "Bold Red"
+
+[[strip]]
+name = "carriage return becomes a space"
+input = "Line 1\rLine 2"
+want = "Line 1 Line 2"
+
+[[strip]]
+name = "space runs collapse"
+input = "Text    with     spaces"
+want = "Text with spaces"
+
+# ── needs_yes ────────────────────────────────────────────────────────────────
+# Decides `yes\r` against `\r`, nothing else. Note the last case: "Yes" appears
+# before "Enter", and `Enter.*yes` must not match across the newline — the
+# regex runs without the `s` flag, in Rust exactly as in Go.
+
+[[needs_yes]]
+name = "explicit type yes"
+input = "Type 'yes' to continue"
+want = true
+
+[[needs_yes]]
+name = "enter yes"
+input = "Enter yes to confirm"
+want = true
+
+[[needs_yes]]
+name = "y/n shorthand"
+input = "Proceed? (y/n)"
+want = true
+
+[[needs_yes]]
+name = "plain Enter is enough"
+input = "Enter to approve"
+want = false
+
+[[needs_yes]]
+name = "button dialog needs no word"
+input = "1. Yes\n2. No\nEnter to approve"
+want = false

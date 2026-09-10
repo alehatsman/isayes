@@ -29,7 +29,7 @@ answering off.
 
 **Out**
 
-- Windows. POSIX PTY only (§13).
+- Windows. POSIX PTY only (D4).
 - A rule engine — "approve `Bash`, refuse `Write`". It says yes or it is off.
 - A config file, a profile, a persisted approval log.
 - Rewriting or delaying Claude's output (§13 I1). It is read — for detection
@@ -45,7 +45,7 @@ isayes [OPTIONS] [--] [CLAUDE_ARGS...]
 
 | Flag | Default | Rule |
 |---|---|---|
-| `--delay N` | `0` | Seconds before an answer. Integer, `0..=60`. Out of range is a usage error, exit 1. |
+| `--delay N` | `0` | Seconds before an answer. Integer, `0..=60`. Out of range is a usage error, exit 2 (§12). |
 | `--help` | | Usage, options, examples, key table. Exit 0. |
 | `--version` | | Crate version. Exit 0. |
 
@@ -65,7 +65,7 @@ outside the loop:
 | ticker thread | `Tick` every 200 ms |
 | signal thread | `Winch`, `Terminate(signo)` |
 
-Startup order, each step failing the process (§11) rather than degrading:
+Startup order, each step failing the process (§12) rather than degrading:
 
 1. Size the PTY from the real terminal: `rows = height - 1` (floor 1),
    `cols = width`. The reserved row is §7.
@@ -77,6 +77,18 @@ Startup order, each step failing the process (§11) rather than degrading:
 Teardown is one idempotent `cleanup`: restore the termios state, close the PTY,
 kill the child, flush the debug log. It runs on every exit path including
 panic.
+
+**Time is an input, never an ambient fact.** The loop does not call
+`Instant::now()`. `Tick` carries the instant it fired, `Output` and `Input` are
+stamped as the loop receives them, and every deadline comparison is against
+that stamp. The producer threads own the real clock; the loop owns none of it.
+
+This is one constraint and it buys the whole test strategy (D8): the harness in
+§14 drives a 60-second countdown, a 2-second idle rescue and eight overlapping
+dialogs by handing the loop a made-up `Instant`, in microseconds, with no
+sleeps and no flakes. cry-aye's equivalent suite is roughly a minute of
+`time.Sleep` and races on a slow machine. Any function that reads the clock
+behind the loop's back puts that back.
 
 ## 5. The buffer
 
@@ -111,15 +123,37 @@ most recent output, and a tail bounds the cost of scanning on every read.
 |---|---|
 | `1. Yes` \| `1) Yes` \| `• Yes` **and** `[23][.)]\s*No` \| `• No` | 5 |
 | `Enter to approve` \| `Enter to confirm` | 3 |
-| `(y/n)` at end of a line | 3 |
+| `(y/n)` at the end of the tail, trailing whitespace allowed | 3 |
 | `Permission rule` | 3 |
 | `Esc to cancel` | 2 |
 | `Tab to amend` | 2 |
 
 **Threshold: `score >= 3`.** One weak indicator is never enough; the
 yes/no button pair alone is. The threshold is the whole false-positive
-defence — prose and code blocks that merely *mention* a yes/no reach 2 at
-worst (§12 I6).
+defence — prose that merely *mentions* a yes/no reaches 2 at worst (§13 I6).
+
+**Known hazard, not a bug.** A code block or a transcript that reproduces a
+*complete* dialog — `1. Yes`, `2. No`, `Enter to approve` — scores like the
+real thing and gets answered. cry-aye's `TestIsPrompt_CodeBlockSafety` asserts
+exactly that: all three of its fenced-code cases detect. The name is a
+misnomer; the test documents the hazard rather than defending against it.
+
+Do not try to fix this in the detector. Nothing in the byte stream separates a
+dialog Claude is *showing* from one Claude is *quoting* — backtick counting
+fails the moment output is truncated or a fence is split across reads, and any
+heuristic that suppresses a quoted dialog will eventually suppress a real one,
+which is the far worse failure. `Ctrl+A` and a non-zero `--delay` are the
+mitigations. A port that "improves" on this breaks three ported tests.
+
+**Two regex traps, both silent.** Neither is a Rust/Go difference — the
+defaults agree, and the danger is an implementer "fixing" them:
+
+- `\(y/n\)\s*$` is **not** multi-line. `$` means end of the tail, not end of a
+  line, in Go's RE2 and in Rust's `regex` alike. Adding `(?m)` makes a `(y/n)`
+  anywhere in the scrollback score 3, and 3 is the threshold.
+- `Enter.*yes` is case-insensitive but **not** dot-matches-newline. Adding
+  `(?s)` makes `1. Yes … Enter to approve` answer with a literal `yes`, which
+  a button dialog reads as a prompt edit. The corpus pins this case.
 
 `needs_yes(buffer)` — case-insensitive `Type.*yes | Enter.*yes | \(y/n\)` on
 the stripped buffer. It decides the answer's bytes, nothing else.
@@ -221,7 +255,7 @@ switched off — it may be a second dialog, and dropping it would lose an answer
 Truncation, not a clear.
 
 A failed PTY write flashes `✗ Failed to send approval` and returns. It never
-retries — the loop must not spin on a dead child (§12 I8).
+retries — the loop must not spin on a dead child (§13 I8).
 
 ## 9. Keys
 
@@ -238,7 +272,7 @@ forwarded to Claude.
 | any | | otherwise | Forwarded to the PTY verbatim. |
 
 An empty read is ignored. A cancel leaves the buffer intact, so the same dialog
-is re-detected on the next output or tick (§12 I9) — cancel is "not yet", not
+is re-detected on the next output or tick (§13 I9) — cancel is "not yet", not
 "never".
 
 ## 10. Status line
@@ -291,10 +325,16 @@ The two are exclusive; the missed-dialog branch returns.
 |---|---|
 | child's | `claude` exited; its status is propagated |
 | 0 | `--help`, `--version` |
-| 1 | bad `--delay`; `claude` not on PATH or PTY spawn failed; stdin is not a TTY; an unrecoverable I/O error |
-| 2 | panic — after `cleanup` |
-| 128+signo | `SIGINT`, `SIGTERM`, `SIGHUP` — after `cleanup` |
+| 1 | `claude` not on PATH or PTY spawn failed; stdin is not a TTY; an unrecoverable I/O error |
+| 2 | usage error — a bad `--delay`, an unknown flag |
 | 3 | *temporary:* the wrapper is not implemented yet. Removed when §4 lands. |
+| 101 | panic — after `cleanup` |
+| 128+signo | `SIGINT`, `SIGTERM`, `SIGHUP` — after `cleanup` |
+
+Two of those are deviations from cry-aye, both deliberate (D3): it exits 1 on a
+bad `--delay` and 2 on a panic. 2 is clap's code for a usage error and 101 is
+what a panicking Rust process returns on its own; overriding either would mean
+writing code whose only purpose is to disagree with the ecosystem's default.
 
 `SIGWINCH` is not an exit: re-read the size, resize the PTY, re-apply the
 scroll region, redraw the bar — in that order (§7).
@@ -316,29 +356,39 @@ The properties the tests exist to hold. Each one has cost a bug once.
 7. **`yes` precedes `\r`.** In one write, in that order.
 8. **A dead PTY does not spin.** A write failure flashes and returns.
 9. **Cancel is not permanent.** The same dialog is re-detected afterwards.
-10. **Rapid dialogs each get exactly one answer**, in order, with no deadlock.
-11. **The status rows are unreachable by the child.** No volume of output, no
+10. **Sequential dialogs each get their own answer.** One that arrives after
+    the previous was answered is answered in its turn — the watermark narrows
+    the buffer, it does not deafen the tool.
+11. **Overlapping dialogs coalesce, and never deadlock.** Dialogs arriving
+    faster than the countdown may yield fewer answers than dialogs. That is
+    correct, not a defect: the redraw after each answer re-surfaces whatever
+    is still pending, so nothing is lost, only merged. What is guaranteed is
+    that at least one answer is sent and the loop keeps serving events.
+12. **The status rows are unreachable by the child.** No volume of output, no
     resize, no alternate-screen toggle and no reset sequence leaves the bar
     scrolled, smeared or overwritten. Re-assert, do not hope.
-12. **The terminal is handed back clean.** Full-height scroll region, cleared
+13. **The terminal is handed back clean.** Full-height scroll region, cleared
     status rows, restored termios — on every exit path, including panic and
     signal.
 
 ## 14. Test contract
 
-- **Unit** — `strip_ansi`, `is_prompt`, `needs_yes` against captured real
-  dialogs, a false-positive corpus (prose, code blocks, transcripts), and a
-  full-buffer sample with real escape sequences.
-- **Loop** — a harness that drives the same event loop from an in-memory PTY
-  pair with synthetic output. Never spawns `claude`. Covers every invariant in
-  §13.
+- **Detector** — a loop over `tests/fixtures/detector.toml` (D9): captured real
+  dialogs with a minimum score, a false-positive corpus, the quoted-dialog
+  hazard cases, `strip_ansi` pairs and `needs_yes` pairs. 27 cases, verified
+  against this section as written.
+- **Engine** — construct an `Engine`, feed it `Event`s stamped with invented
+  instants, assert on the `Vec<Action>` returned. No PTY, no terminal, no
+  threads, no sleeps, no `claude`. Every invariant I1–I11 is reachable this
+  way, and the whole suite runs in under a second — if it does not, something
+  read the clock (D8).
 - **CLI** — `--delay` bounds, `--help`, `--` pass-through, exit codes.
 - **Terminal** — the margin logic is a pure function over a chunk of child
   output (`needs_remargin(chunk) -> bool`) and a pure sequence builder
-  (`margin(height) -> Vec<u8>`), so I11 is unit-testable without a terminal:
+  (`margin(height) -> Vec<u8>`), so I12 is unit-testable without a terminal:
   feed `ESC[?1049h`, `ESC[?1049l`, `ESC[1;40r`, `ESC[!p`, `ESC c`, a split
   escape across two chunks, and a plain paragraph, and assert the verdict.
-  Teardown (I12) is asserted on the byte stream a `Drop` produces.
+  Teardown (I13) is asserted on the byte stream a `Drop` produces.
 
 Every invariant in §13 names at least one test.
 

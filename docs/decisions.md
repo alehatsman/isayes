@@ -128,3 +128,49 @@ visible flicker on every repaint, a margin lost faster than it is restored —
 then the reservation is not obtainable by cooperation and compositing is the
 only remaining answer. That is a rewrite of §7 and nothing else; the detector,
 the loop and the watermark do not care.
+
+## D8 — The loop never reads the clock
+
+**Decision.** Time enters the event loop as data. `Tick(Instant)` carries the
+instant it fired; `Output` and `Input` are stamped on receipt; deadlines are
+compared against that stamp. `Instant::now()` appears in the producer threads
+and nowhere else (spec §4).
+
+**Why.** cry-aye's test suite is built on `time.Sleep`. Twenty-three tests,
+sleeps from 20 ms to 3 s, a rapid-fire case that can run fifteen seconds, and a
+write-failure case that sleeps three seconds and asserts nothing at all — it is
+a hang detector wearing a test's clothes. It is slow, it races on a loaded
+machine, and it can only assert coarse outcomes, because anything finer is a
+timing gamble.
+
+Stamped events remove all of it. A 60-second countdown, the 2-second idle
+threshold and the 3-second rescue cooldown are all exercised by handing the
+loop an `Instant` that is 60 seconds later. The suite runs in microseconds,
+asserts exact transitions instead of "at least one approval eventually", and
+cannot flake.
+
+The cost is one field on an enum variant and the discipline not to call `now()`
+in a helper. That is one careless line to reintroduce, so it is written down
+here rather than left as a style someone might notice.
+
+**Overturned by.** Nothing. A future feature that genuinely needs wall-clock
+inside the loop gets another stamped event.
+
+## D9 — The detector corpus is data, not Rust
+
+**Decision.** cry-aye's detector cases live in `tests/fixtures/detector.toml`
+— inputs, expected verdict, expected minimum score — and the Rust tests are a
+loop over that file.
+
+**Why.** The corpus is the actual contract of §6, it came from a Go test file
+nobody will keep reading, and it is the one artifact several agents need at
+once. As data it is reviewable in a diff, extendable by anyone who captures a
+new dialog, and impossible to half-port. As inline Rust it would be copied,
+reworded and quietly diverged.
+
+Captured dialogs go in as new entries. That is the maintenance path for the
+liability in plan.md: when Claude Code changes a string, the fix is a fixture
+plus a row in §6's table, not a redesign.
+
+**Overturned by.** Nothing. If the corpus grows past a few hundred cases it
+splits into files per category, still data.

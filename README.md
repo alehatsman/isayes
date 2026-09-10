@@ -9,8 +9,14 @@ threshold it sends `\r` — after a countdown you can cancel, adjust, or turn of
 entirely.
 
 Rust port of [cry-aye](https://github.com/alehatsman/cry-aye).
-**Status: spec written, wrapper not implemented.** See
-[docs/spec.md](docs/spec.md).
+**Status: spec and seams written, wrapper not implemented.**
+
+| | |
+|---|---|
+| [docs/spec.md](docs/spec.md) | the contract — 15 sections, 13 invariants |
+| [docs/architecture.md](docs/architecture.md) | module map and the signatures between phases |
+| [docs/plan.md](docs/plan.md) | phases, tasks, done-when |
+| [docs/decisions.md](docs/decisions.md) | D1–D9 |
 
 ```
 isayes                          # drop-in for `claude`
