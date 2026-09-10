@@ -98,16 +98,22 @@ pub fn is_prompt(text: &str) -> Detection {
     let tail = tail_lines(&clean, TAIL_LINES);
 
     let mut score = 0;
+    // Has anything appeared that can actually be *answered*? Buttons, an
+    // "Enter to …" hint, a `(y/n)`. `Permission rule`, `Esc to cancel` and
+    // `Tab to amend` are context: they corroborate a dialog, they are not one.
+    let mut actionable = false;
     let mut hits = Vec::new();
 
     let has_yes =
         tail.contains("1. Yes") || tail.contains("1) Yes") || tail.contains("\u{2022} Yes");
     if has_yes && YES_NO.is_match(&tail) {
         score += 5;
+        actionable = true;
         hits.push("yes_no_buttons");
     }
     if tail.contains("Enter to approve") || tail.contains("Enter to confirm") {
         score += 3;
+        actionable = true;
         hits.push("enter_to_approve");
     }
     if tail.contains("Esc to cancel") {
@@ -120,6 +126,7 @@ pub fn is_prompt(text: &str) -> Detection {
     }
     if YN_AT_END.is_match(&tail) {
         score += 3;
+        actionable = true;
         hits.push("yn_prompt");
     }
     if tail.contains("Permission rule") {
@@ -128,7 +135,17 @@ pub fn is_prompt(text: &str) -> Detection {
     }
 
     Detection {
-        detected: score >= THRESHOLD,
+        // Both conditions. The second was found by running the wrapper against
+        // a real PTY: a dialog arrives over several reads, and `Permission
+        // rule` lands in an earlier one than the buttons. Scoring 3 on its own,
+        // it was answered before there was anything to answer — and then the
+        // buttons arrived and were answered again. `Esc to cancel` plus `Tab
+        // to amend` sums to 4 and is the same mistake from the other end.
+        //
+        // Sending `\r` at a dialog that has not finished rendering is the
+        // worst thing this tool can do: the keystroke lands somewhere nobody
+        // chose.
+        detected: score >= THRESHOLD && actionable,
         score,
         hits,
     }

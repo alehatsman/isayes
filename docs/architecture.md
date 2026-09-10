@@ -95,19 +95,33 @@ pub const STATUS_ROWS: u16 = 1;
 pub struct Terminal { /* … */ }
 
 impl Terminal {
-    /// Raw mode, size, PTY winsize, margin, screen clear. Fails the process.
-    pub fn acquire(pty: &Pty) -> Result<Self, Error>;
-    pub fn size(&self) -> (u16, u16);
-    /// SIGWINCH: re-read size, resize the PTY, re-apply the margin. §7.
-    pub fn resize(&mut self) -> Result<(), Error>;
+    /// Raw mode and size. Does NOT set the margin — see below.
+    pub fn acquire() -> io::Result<Self>;
+    /// Clear the screen and take the scroll region. Called after the spawn.
+    pub fn start(&mut self) -> io::Result<()>;
+    pub fn width(&self) -> u16;
+    pub fn pty_rows(&self) -> u16;
+    pub fn refresh_size(&mut self) -> io::Result<()>;
+    pub fn apply_margin(&mut self) -> io::Result<()>;
     /// stdout, byte for byte, then the re-margin scan. Never rewrites.
     pub fn pass_through(&mut self, bytes: &[u8]) -> io::Result<()>;
-    pub fn draw_status(&mut self, text: &str, colour: &str);
-    pub fn force_redraw(&mut self);
+    pub fn draw_status(&mut self, text: &str, colour: &str) -> io::Result<()>;
 }
 
 impl Drop for Terminal { /* full-height region, clear bar, restore termios */ }
 ```
+
+Three differences from the draft above it, all forced by building it:
+
+- **`acquire` takes no PTY and does not set the margin.** The child's first act
+  is a full-height `DECSTBM` reset (measured, §7), so a margin set before the
+  spawn does not survive. `start()` runs after, and `MarginWatch` catches the
+  reset if the timing slips.
+- **`force_redraw` and `resize` moved to `Child`.** Both resize the PTY, which
+  is the child's file descriptor, not the terminal's.
+- **Our control bytes go to stderr, the child's to stdout.** Both land on the
+  same tty and the loop is single-threaded, so ordering is write order — and
+  stdout stays exactly what the child wrote (§13 I1).
 
 Two pure functions carry the parts worth testing, so I12 needs no terminal:
 
@@ -150,8 +164,23 @@ pub enum Event {
     Eof,
 }
 
-pub fn spawn(pty: &Pty) -> Receiver<Event>;   // phase 1
+pub struct Child { /* master pty, writer, child handle */ }
+
+impl Child {
+    pub fn spawn(args: &[String], rows: u16, cols: u16)
+        -> anyhow::Result<(Self, Receiver<Event>)>;
+    pub fn write(&mut self, bytes: &[u8]) -> io::Result<()>;
+    pub fn resize(&self, rows: u16, cols: u16);
+    /// §7's width toggle. Restores on a thread after 50 ms so the two
+    /// SIGWINCHs cannot be coalesced.
+    pub fn force_redraw(&self, rows: u16, cols: u16);
+    pub fn wait(&mut self) -> u8;
+    pub fn kill(&mut self);
+}
 ```
+
+`spawn` returns the child *and* the receiver: the producer threads need the
+PTY, and nothing else should be able to hold it.
 
 **The enum landed with phase 3, `spawn` lands with phase 1.** The engine is the
 only consumer and had to be buildable before a PTY existed. `Winch` carries an

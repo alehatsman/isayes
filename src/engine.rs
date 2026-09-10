@@ -25,6 +25,18 @@ const IDLE: Duration = Duration::from_secs(2);
 /// Spec §11. A rescue redraw costs a repaint, so it is rate-limited.
 const RESCUE_COOLDOWN: Duration = Duration::from_secs(3);
 
+/// Spec §8, D12. No dialog is answered within this long of the last answer.
+///
+/// A dialog arrives over several PTY reads, and the watermark only discards
+/// what came *before* the countdown. A later read carrying the rest of the
+/// same dialog is scored fresh and answered again — measured against a real
+/// PTY, where one dialog drew three answers. A second `\r` can confirm a
+/// dialog the operator never saw, which is the worst thing this tool can do.
+///
+/// No legitimate dialog appears this fast: the child has to consume the
+/// answer, run the tool and repaint first.
+const ANSWER_COOLDOWN: Duration = Duration::from_millis(500);
+
 const FLASH: Duration = Duration::from_millis(800);
 const FLASH_CANCEL: Duration = Duration::from_millis(500);
 const FLASH_ERROR: Duration = Duration::from_secs(1);
@@ -88,6 +100,8 @@ pub struct Engine {
     /// matching cannot see a `Ctrl+A` the terminal encoded, and cannot tell a
     /// focus event from a keypress.
     input: InputParser,
+    /// When the last answer went out, for [`ANSWER_COOLDOWN`].
+    answered_at: Option<Instant>,
     last_output: Instant,
     /// `None` until the first rescue. Seeding it with the start time would be
     /// claiming a rescue that never happened, and would hold the first real one
@@ -107,6 +121,7 @@ impl Engine {
             approvals: 0,
             flash: None,
             input: InputParser::new(),
+            answered_at: None,
             last_output: started,
             last_rescue: None,
         }
@@ -146,10 +161,20 @@ impl Engine {
             self.buffer.drain(..self.buffer.len() - BUFFER_CAP);
         }
 
-        if self.auto_approve && self.countdown.is_none() && self.buffer_is_prompt() {
+        if self.auto_approve
+            && self.countdown.is_none()
+            && !self.in_cooldown(now)
+            && self.buffer_is_prompt()
+        {
             return self.start_countdown(now);
         }
         Vec::new()
+    }
+
+    /// Too soon after the last answer to believe a new dialog (D12).
+    fn in_cooldown(&self, now: Instant) -> bool {
+        self.answered_at
+            .is_some_and(|at| now.duration_since(at) < ANSWER_COOLDOWN)
     }
 
     fn on_input(&mut self, bytes: &[u8], now: Instant) -> Vec<Action> {
@@ -245,7 +270,7 @@ impl Engine {
 
         // A dialog that arrived while a countdown was running was never offered
         // to detection. This is the only thing that finds it.
-        if !self.buffer.is_empty() && self.buffer_is_prompt() {
+        if !self.in_cooldown(now) && !self.buffer.is_empty() && self.buffer_is_prompt() {
             return self.start_countdown(now);
         }
 
@@ -284,6 +309,7 @@ impl Engine {
             .take()
             .map_or(self.buffer.len(), |c| c.watermark);
         self.approvals += 1;
+        self.answered_at = Some(now);
 
         // Decided from the *whole* buffer, before the truncation below.
         let wants_word = detector::needs_yes(&self.text());
@@ -658,9 +684,11 @@ mod tests {
         let t0 = origin();
         let mut e = Engine::new(0, t0);
 
+        // Spaced past the cooldown (D12) — a genuine second dialog cannot
+        // appear while the child is still processing the first answer.
         assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 1);
-        assert_eq!(n_answers(&out(&mut e, t0, 100, DIALOG)), 1);
-        assert_eq!(n_answers(&out(&mut e, t0, 200, DIALOG)), 1);
+        assert_eq!(n_answers(&out(&mut e, t0, 700, DIALOG)), 1);
+        assert_eq!(n_answers(&out(&mut e, t0, 1_400, DIALOG)), 1);
         assert_eq!(e.approvals(), 3);
     }
 

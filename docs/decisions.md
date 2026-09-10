@@ -242,3 +242,37 @@ is acceptable — nothing in §9 binds bare `Esc`.
 **Overturned by.** Claude Code dropping the keyboard protocols, which would
 remove the first half but not the second: focus and paste come from the
 terminal regardless.
+
+## D12 — A dialog must be answerable, and not answered twice
+
+**Decision.** Two rules, both from running the wrapper against a real PTY
+rather than from reading the Go code:
+
+1. Detection requires an **answerable** indicator, not just a score of 3
+   (spec §6). `Permission rule`, `Esc to cancel` and `Tab to amend`
+   corroborate a dialog; the buttons, `Enter to …` and `(y/n)` are one.
+2. No answer goes out within **500 ms** of the previous one (spec §8).
+
+**Why.** A dialog does not arrive in one PTY read. Against a real terminal,
+one Claude Code permission dialog drew **three** answers: `Permission rule`
+landed in read one and scored 3 by itself, the buttons landed in read two and
+scored 5, and the trailing `Esc to cancel · Tab to amend` landed in read three
+and summed to 4. The watermark cannot help — it discards what came *before*
+the countdown, and each of these arrived after.
+
+Rule 1 removes the cause: none of the three fragments is answerable on its own.
+Rule 2 is the backstop for what rule 1 cannot see — a repaint of the dialog we
+just answered is byte-identical to the dialog, and the child repaints
+constantly.
+
+This matters more than a duplicate keystroke usually would. An extra `\r`
+does not land on the dialog we answered; it lands on whatever renders next.
+The tool's entire risk profile is "a keystroke goes somewhere nobody chose",
+and partial delivery was a live path to exactly that.
+
+**Cost.** Genuinely sequential dialogs are answered up to 500 ms later, via the
+watchdog rather than the output path. Nothing else changes.
+
+**Overturned by.** Nothing for rule 1. Rule 2 could go if a future design
+tracked dialog identity instead of re-scoring a buffer — which would mean
+knowing what the child is showing, which is D7's rejected branch.

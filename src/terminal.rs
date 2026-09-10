@@ -448,3 +448,119 @@ mod tests {
         assert!(!watch.feed(b"plain"));
     }
 }
+
+// ── The real terminal (tasks 1.1, 1.3, 1.4) ──────────────────────────────────
+
+use std::io::{self, Write};
+
+/// The wrapper's claim on the real terminal: raw mode, the scroll region, and
+/// the status rows.
+///
+/// Acquiring it changes global state, so releasing it is `Drop`'s job and not
+/// a method anyone can forget to call (§13 I13).
+#[derive(Debug)]
+pub struct Terminal {
+    width: u16,
+    height: u16,
+    watch: MarginWatch,
+    raw: bool,
+}
+
+impl Terminal {
+    /// Raw mode on, size read. The margin is **not** applied yet: the child
+    /// resets it as its first act (measured, §7), so [`start`](Self::start)
+    /// runs after the spawn.
+    pub fn acquire() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let (width, height) = crossterm::terminal::size()?;
+        Ok(Self {
+            width,
+            height,
+            watch: MarginWatch::new(),
+            raw: true,
+        })
+    }
+
+    /// Clear the screen and take the scroll region. Spec §4 step 4.
+    pub fn start(&mut self) -> io::Result<()> {
+        let mut out = io::stderr();
+        out.write_all(b"\x1b[2J\x1b[H")?;
+        out.write_all(&margin(self.height))?;
+        out.flush()
+    }
+
+    /// Columns. The child gets all of them; only rows are reserved.
+    #[must_use]
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Rows the child gets — everything but ours, and never zero.
+    #[must_use]
+    pub fn pty_rows(&self) -> u16 {
+        self.height.saturating_sub(STATUS_ROWS).max(1)
+    }
+
+    /// Re-read the size after a `SIGWINCH`. Spec §12.
+    pub fn refresh_size(&mut self) -> io::Result<()> {
+        let (width, height) = crossterm::terminal::size()?;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
+    /// Re-apply the scroll region, cursor preserved.
+    pub fn apply_margin(&mut self) -> io::Result<()> {
+        let mut out = io::stderr();
+        out.write_all(&remargin(self.height))?;
+        out.flush()
+    }
+
+    /// The child's bytes, byte for byte, to stdout — then the re-margin scan.
+    ///
+    /// Our own control sequences go to **stderr**, never stdout, so stdout
+    /// stays exactly what the child wrote (§13 I1). Both land on the same tty
+    /// and the loop is single-threaded, so ordering is the write order.
+    pub fn pass_through(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut out = io::stdout();
+        out.write_all(bytes)?;
+        out.flush()?;
+        if self.watch.feed(bytes) {
+            self.apply_margin()?;
+        }
+        Ok(())
+    }
+
+    /// Draw the status bar on the row the child cannot reach. Spec §10.
+    pub fn draw_status(&mut self, text: &str, colour: &str) -> io::Result<()> {
+        if self.height < 1 {
+            return Ok(());
+        }
+        let mut out = io::stderr();
+        // Save cursor, jump to the reserved row, clear it, reset the character
+        // set (ESC(B) so a child that switched to line-drawing does not turn
+        // the bar into boxes, write, restore.
+        write!(
+            out,
+            "\x1b7\x1b[{};1H\x1b[K\x1b(B\x1b[{colour}m{text}\x1b[0m\x1b8",
+            self.height
+        )?;
+        out.flush()
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        // Every exit path, including panic (§13 I13). A leftover margin leaves
+        // the user's shell rendering into a box.
+        let mut out = io::stderr();
+        crate::ignore(out.write_all(RESET_MARGIN));
+        if self.height >= 1 {
+            crate::ignore(write!(out, "\x1b[{};1H\x1b[K", self.height));
+        }
+        crate::ignore(out.flush());
+        if self.raw {
+            crate::ignore(crossterm::terminal::disable_raw_mode());
+        }
+    }
+}
