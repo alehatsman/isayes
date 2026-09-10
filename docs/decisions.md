@@ -198,3 +198,47 @@ never fires into one that does — an upside, not a tax.
 
 **Overturned by.** Nothing. The binary stays thin; logic that appears in
 `main.rs` belongs in a module.
+
+## D11 — Stdin is parsed, not pattern-matched
+
+**Decision.** The input path splits stdin into complete units before §9's key
+table is consulted: a raw byte, or a whole escape sequence. A unit is then
+classified as a hotkey (in any of its three encodings), a terminal report, or
+an ordinary keystroke. Only the last cancels a countdown. Reports are forwarded
+and are never treated as input.
+
+**Why.** Measured, 2026-09-10 — see [measurements.md](measurements.md). Claude
+Code's startup turns on `modifyOtherKeys=2`, the Kitty keyboard protocol, focus
+reporting, bracketed paste and theme notifications, and it queries the terminal
+twice. Two consequences that byte matching cannot survive:
+
+`Ctrl+A` does not arrive as `0x01` on a terminal that honours either keyboard
+mode. It arrives as `ESC[27;5;97~` or `ESC[97;5u`. cry-aye's toggle is dead on
+kitty, foot, WezTerm, iTerm2 and recent xterm, and works in Terminal.app, which
+implements neither — which is why this has never been reported.
+
+Focus events, paste markers and query replies are bytes on stdin that are not
+keystrokes. Under §9's "any other key cancels", clicking away from the window
+during a countdown cancels the approval *and* eats a reply the child may be
+blocking on.
+
+**Why not just add the new byte patterns.** Because the set is open. Three
+encodings today, and a terminal may send a report at any moment, of a length
+the wrapper cannot know without parsing to the final byte. Matching prefixes
+gets the common cases and silently mangles the rest — which is the failure mode
+already in the tree.
+
+The parser is small and it already exists in the other direction:
+`terminal::MarginWatch` is the same shape pointed at the child's output. This
+is its mirror, and it is the one place the wrapper is allowed to *hold* input
+rather than forward it immediately, because a half-read escape sequence is not
+yet anything.
+
+**Cost.** A partial sequence at a read boundary must not stall a keystroke
+forever. A lone `ESC` is a real key; the parser resolves it as one when the
+next read does not continue it, which means `Esc` is decided a read late. That
+is acceptable — nothing in §9 binds bare `Esc`.
+
+**Overturned by.** Claude Code dropping the keyboard protocols, which would
+remove the first half but not the second: focus and paste come from the
+terminal regardless.

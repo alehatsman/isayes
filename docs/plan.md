@@ -16,7 +16,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 | Phase | Branch | Gate | State |
 |---|---|---|---|
 | 0 — scaffold, spec, seams | `main` | seven tasks validate; gate green; corpus verified | done |
-| 1 — terminal | `feat/terminal` | the four abuses below | 1.2 done; 1.0–1.5 open |
+| 1 — terminal | `feat/terminal` | the four abuses below | 1.0, 1.2 done; 1.1, 1.3–1.5 open |
 | 2 — detector | `feat/detector` | 27 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
@@ -33,11 +33,17 @@ signature and can start against a stub. See architecture.md's diagram.
 First, because it is the part that is **broken today** and the only part whose
 spec is inference rather than observation.
 
-### 1.0 — Measure, before writing anything
+### 1.0 — Measure, before writing anything — **done**
 
-Three beliefs in §7 are inherited, not observed. Settle them with `script`,
-`tmux` or a PTY capture of a real `claude` session and **write what you find
-into §7 in the same branch**. Any of the three can rewrite the phase.
+Run `./scripts/measure.sh`. Results are in [measurements.md](measurements.md);
+§7, §9 and D7 now cite it. Summary: no alternate screen, no resets, one
+startup `DECSTBM` reset that destroys our margin, one `DECSC` pair, and **no
+repaint on a bare `SIGWINCH`** — so `force_redraw` and §11's idle rescue both
+stay. The capture also found two defects §9 did not know about (D11).
+
+Re-run it when Claude Code updates. None of this is documented or stable.
+
+**Done when:** every row below has an answer recorded in §7 or D7.
 
 | Question | Why it matters |
 |---|---|
@@ -71,6 +77,11 @@ time, and the false positives that would cost a repaint on every colour change
 `needs_remargin` became `MarginWatch::feed`; it cannot be a free function
 (architecture.md says why). Applying it at startup and on each trigger is
 1.1/1.4's job.
+
+**Done when:** `margin` and the scanner are asserted, without a terminal,
+against every trigger in §7's table, the multi-parameter and legacy
+alternate-screen forms, an escape split at every byte, and the near-misses that
+must not fire — `?1000h`, `?2004h`, `ESC[0p`, `ESC[?2r`, OSC bodies.
 
 ### 1.3 — The bar
 

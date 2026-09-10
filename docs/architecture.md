@@ -119,10 +119,10 @@ impl MarginWatch {
 
 `needs_remargin` was drafted as a free function. It cannot be one: an escape
 sequence splits across PTY reads at any byte, so the carry has to live
-somewhere. It is a four-state machine over bytes — ground, escape, CSI, with
-parameter and intermediate buffers — and the machine *is* the carry, so no
-lookback buffer is needed and a sequence delivered one byte at a time is still
-recognised.
+somewhere. It is a three-state machine over bytes — ground, escape, CSI — and the machine
+*is* the carry, so no lookback buffer is needed and a sequence delivered one
+byte at a time is still recognised. There is deliberately no string/OSC state;
+`terminal.rs` documents what that costs.
 
 Comparing the CSI parameters matters: `?1049h` is the alternate screen,
 `?1000h` is mouse reporting, and `p` is only a soft reset with the `!`
