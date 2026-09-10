@@ -19,6 +19,7 @@ pub fn ignore<T, E>(result: Result<T, E>) {
     drop(result);
 }
 
+pub mod debug;
 pub mod detector;
 pub mod engine;
 pub mod events;

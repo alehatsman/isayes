@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
+use isayes::debug::DebugLog;
 use isayes::engine::{Action, Engine};
 use isayes::events::{Child, Event};
 use isayes::ignore;
@@ -63,6 +64,15 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
     // reset and pass_through re-applies, which is what makes it stick.
     term.start()?;
 
+    let mut log = DebugLog::open();
+    log.line(&format!(
+        "start delay={}s size={}x{} args={:?}",
+        cli.delay,
+        term.width(),
+        term.pty_rows(),
+        cli.claude_args
+    ));
+
     let mut engine = Engine::new(cli.delay, Instant::now());
     let mut exit = 0u8;
 
@@ -87,13 +97,20 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         }
 
         let mut actions = engine.handle(event);
+        if log.enabled()
+            && let Some(detection) = engine.take_detection()
+        {
+            log.detection(&detection);
+        }
         // A failed write comes back as an event rather than a retry, so the
         // loop cannot spin on a dead child (§13 I8).
         let mut failed_at = None;
         for action in actions.drain(..) {
             match action {
                 Action::Answer(bytes) => {
+                    log.line(&format!("ANSWER {bytes:?} (#{})", engine.approvals()));
                     if child.write(&bytes).is_err() {
+                        log.line("ANSWER FAILED — child is gone");
                         failed_at = Some(Instant::now());
                     }
                 }
@@ -104,7 +121,10 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                     ignore(child.write(&bytes));
                 }
                 Action::Status { text, colour } => term.draw_status(&text, colour)?,
-                Action::ForceRedraw => child.force_redraw(term.pty_rows(), term.width()),
+                Action::ForceRedraw => {
+                    log.line("force redraw");
+                    child.force_redraw(term.pty_rows(), term.width());
+                }
                 Action::Exit(code) => {
                     child.kill();
                     return Ok(code);

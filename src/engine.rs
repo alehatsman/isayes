@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::detector;
+use crate::detector::{self, Detection};
 use crate::events::Event;
 use crate::input::{self, Hotkey, InputParser, Unit};
 
@@ -100,6 +100,9 @@ pub struct Engine {
     /// matching cannot see a `Ctrl+A` the terminal encoded, and cannot tell a
     /// focus event from a keypress.
     input: InputParser,
+    /// What the detector last concluded, for the debug log (§15). The engine
+    /// does no I/O, so it remembers and `main` writes.
+    last_detection: Option<Detection>,
     /// When the last answer went out, for [`ANSWER_COOLDOWN`].
     answered_at: Option<Instant>,
     last_output: Instant,
@@ -121,6 +124,7 @@ impl Engine {
             approvals: 0,
             flash: None,
             input: InputParser::new(),
+            last_detection: None,
             answered_at: None,
             last_output: started,
             last_rescue: None,
@@ -434,8 +438,17 @@ impl Engine {
         String::from_utf8_lossy(&self.buffer).into_owned()
     }
 
-    fn buffer_is_prompt(&self) -> bool {
-        detector::is_prompt(&self.text()).detected
+    fn buffer_is_prompt(&mut self) -> bool {
+        let detection = detector::is_prompt(&self.text());
+        let detected = detection.detected;
+        self.last_detection = Some(detection);
+        detected
+    }
+
+    /// What the detector last concluded. `main` logs it; nothing else reads it.
+    #[must_use]
+    pub fn take_detection(&mut self) -> Option<Detection> {
+        self.last_detection.take()
     }
 }
 

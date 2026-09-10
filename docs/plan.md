@@ -259,10 +259,19 @@ version them. A UI change silently drops the score below 3 and the tool stops
 working with **no error at all**, which is the worst failure mode in this
 design.
 
-The mitigation is not a cleverer detector. It is that `ISAYES_DEBUG=1` logs
-every score with the indicators that matched (§15), so "it stopped approving"
-is one `tail` away from "the `Esc to cancel` string moved" — and the fix is a
-fixture plus a table row, not a redesign. Build it in phase 2, not later.
+The mitigation is not a cleverer detector. It is `ISAYES_DEBUG=1` (§15), which
+logs every score above zero with the indicators that matched — including the
+ones that did **not** cross, because a dialog that suddenly scores 2 instead of
+5 is the symptom. "It stopped approving" is one `tail` away from "the `Esc to
+cancel` string moved", and the fix is a fixture plus a table row.
+
+Built. A real run looks like this, and the first line is D12's fix working:
+
+```
+[    1.037] below    score=3 hits=[permission_rule]
+[    1.038] DETECTED score=12 hits=[yes_no_buttons,esc_to_cancel,tab_to_amend,permission_rule]
+[    1.038] ANSWER [13] (#1)
+```
 
 ## Not in any phase
 
