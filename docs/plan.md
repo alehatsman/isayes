@@ -19,6 +19,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 | 1 — terminal | `feat/terminal` | the four abuses below | 1.0, 1.2 done; 1.1, 1.3–1.5 open |
 | 2 — detector | `feat/detector` | 27 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
+| 3b — input (D11) | `feat/input` | hotkeys in all three encodings; reports never cancel | parser done; engine not yet wired |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
 
 **1 and 2 are parallel.** They share no file. 3 needs only `detector`'s
@@ -216,6 +217,31 @@ One test per invariant, named for it. The mapping is the deliverable:
 second. If it takes longer than that, a clock got read somewhere (D8).
 
 ---
+
+## Phase 3b — the input parser (D11)
+
+`input.rs`. Spec §9, decision D11. **Parser done; the engine does not use it
+yet.**
+
+New scope, created by the 1.0 measurement rather than planned. 21 tests:
+`Ctrl+A` in all three encodings, focus events and query replies as reports,
+paste markers around a paste, sequences split at every byte, the lone-`Esc`
+hold-and-flush, and the bounded recovery from an unterminated string sequence.
+
+### 3b.1 — Wire it into the engine — **open**
+
+`Engine::on_input` still matches raw bytes. It should take `Vec<Unit>` and act
+on the classification:
+
+- `Unit::Hotkey` — §9's four actions. Never forwarded.
+- `Unit::Key` — forwarded; cancels a running countdown.
+- `Unit::Report` — forwarded; **never** cancels.
+
+`InputParser::flush` needs a caller: a lone `Esc` is held until something says
+no more bytes are coming, and the 200 ms tick is that something.
+
+**Done when:** an engine test proves a focus event arriving mid-countdown does
+not cancel it, and that `ESC[27;5;97~` toggles auto-approve.
 
 ## Phase 4 — wiring and cut-over
 
