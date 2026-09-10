@@ -174,3 +174,24 @@ plus a row in §6's table, not a redesign.
 
 **Overturned by.** Nothing. If the corpus grows past a few hundred cases it
 splits into files per category, still data.
+
+## D10 — A library target, with the binary as a thin shell
+
+**Decision.** `src/lib.rs` holds the modules; `src/main.rs` is the CLI and the
+wiring. Module surfaces are `pub`, not `pub(crate)`.
+
+**Why.** Forced by the gate, and worth having anyway. In a bin-only crate every
+module the binary has not wired up yet is `dead_code` — an error under
+`-D warnings` — so a phase that lands before the phase that consumes it cannot
+be green. The obvious patch, `#[expect(dead_code)]`, makes it worse:
+`cargo lint` runs `--all-targets`, the tests *do* use the code, the expectation
+goes unfulfilled, and `unfulfilled_lint_expectations` fires instead. There is
+no attribute that is correct in both targets.
+
+A lib target removes the question. Public items in a library are reachable by
+definition, so each phase lands green on its own, in any order, which is what
+the parallel plan depends on. It also turns `missing_docs` from a lint that
+never fires into one that does — an upside, not a tax.
+
+**Overturned by.** Nothing. The binary stays thin; logic that appears in
+`main.rs` belongs in a module.
