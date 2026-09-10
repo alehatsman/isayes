@@ -1,0 +1,42 @@
+---
+description: copy the release binary onto PATH
+
+# Deliberately not `cargo install`: that rebuilds into its own target dir and
+# would double the build time for a binary `tasks/build.yml` has already
+# produced.
+#
+# NOTE — this cannot bootstrap from a clean checkout. provision validates the
+# whole plan before running any of it, so the `file` step's `src` is checked
+# for existence before the `cargo build` step above it has had a chance to
+# create it. On a fresh clone, run `cargo build --release` (or
+# `provision apply tasks/build.yml`) once first. The build step stays here so
+# that a *stale* binary is still rebuilt on every install.
+
+props:
+  dest:
+    type: string
+    default: "~/.local/bin/isayes"
+    description: Where the binary lands. `~` expands.
+
+steps:
+  - name: cargo build --release
+    shell: cargo build --release
+    # This step's exit code is its whole contract — there is no state to
+    # inspect and nothing for provision to be unsure about — so it says so.
+    changed_when: "false"
+    timeout: 20m
+
+  - name: Ensure the destination directory exists
+    file:
+      path: "{{ props.dest | dirname }}"
+      state: dir
+
+  # `../`: a `file` step's `src` resolves against the file that names it, which
+  # is this one, in `tasks/`. A `file` step rather than a `cp` so it reports
+  # `ok` when the binary already on PATH matches.
+  - name: Copy the binary into place
+    file:
+      path: "{{ props.dest }}"
+      src: ../target/release/isayes
+      state: file
+      mode: "0755"
