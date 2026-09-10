@@ -15,6 +15,9 @@ some exit paths and needed a `recover()` to paper over it.
 
 **Overturned by.** Nothing foreseeable.
 
+**Amended 2026-09-10 by D10.** One crate, but two targets — a library holding
+the modules and a thin binary. The reason is the gate, not taste; see D10.
+
 ## D2 — Threads and one channel, not async
 
 **Decision.** Three producer threads (PTY, stdin, ticker) plus a signal
