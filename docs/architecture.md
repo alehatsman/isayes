@@ -19,11 +19,19 @@ the same commit; do not quietly widen it.
 | `detector.rs` | Scoring output. Pure — no I/O, no state, no clock. | §6 | nothing |
 | `terminal.rs` | The real terminal and the PTY's size. Raw mode, the margin, the bar, teardown. | §7 | nothing |
 | `events.rs` | The producer threads and the `Event` enum. The only place `Instant::now()` is called. | §4 | `terminal.rs` |
-| `engine.rs` | All the state and all the decisions. Pure — no I/O, no clock. | §5, §8–§11 | `detector.rs` |
+| `input.rs` | Splitting stdin into units and classifying them. Pure. | §9, D11 | nothing |
+| `engine.rs` | All the state and all the decisions. Pure — no I/O, no clock. | §5, §8–§11 | `detector.rs`, `input.rs` |
 | `debug.rs` | The debug log. | §15 | nothing |
 
-Seven files. If an eighth appears, it is because something above got too big,
-and that is a conversation, not a refactor to do quietly.
+Eight files. `input.rs` is the eighth, and this paragraph is the conversation
+the previous version of it asked for: it is not `engine.rs` outgrowing itself,
+it is scope the 1.0 measurement created (D11). Stdin has to be split into
+complete units and classified before §9's key table means anything, and that is
+a byte-level state machine — the same one `terminal.rs` already runs in the
+other direction. Putting it in `engine.rs` would have put a parser inside the
+state machine that consumes it.
+
+If a ninth appears, same rule.
 
 `engine.rs` is not called `loop.rs` because `loop` is a keyword.
 
