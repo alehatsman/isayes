@@ -5,3 +5,5 @@
 //! piece can be tested without a terminal, a PTY, or a child process.
 
 pub mod detector;
+pub mod engine;
+pub mod events;
