@@ -1,0 +1,139 @@
+# A one-crate workspace. The empty table exists so `[workspace.lints]` below
+# has somewhere to hang: cargo has no include mechanism for manifests, so
+# rust-quality's canonical lint block is pasted rather than referenced, and
+# `rq/lints-check` (tasks/lints-check.yml) reports drift against it.
+[workspace]
+
+[package]
+name = "isayes"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A PTY wrapper for Claude Code that answers its permission dialogs"
+
+# Opt this package into the workspace lint block below. Without it
+# `[workspace.lints]` applies to nothing, which is the whole reason
+# `rq/lints-check` exists.
+[lints]
+workspace = true
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+# The PTY, terminal and signal crates land with the code that uses them
+# (D5) — an unused dependency fails the gate on cargo-machete, correctly.
+
+# rust-quality — canonical lint block.
+#
+# Cargo has no include mechanism for manifests, so this cannot be copied in as
+# a file the way clippy.toml / rustfmt.toml / deny.toml are. Paste this block
+# into the WORKSPACE ROOT Cargo.toml, then opt every member crate in with:
+#
+#     [lints]
+#     workspace = true
+#
+# `scripts/lints-check.sh` (preset `rq/lints-check`) asserts both halves are
+# present and reports drift against this file.
+#
+# Stance: enable the bug-catching groups, disable the style-pedantry members,
+# and cherry-pick from `restriction` — never enable that group wholesale
+# (clippy ships `blanket_clippy_restriction_lints` to say so).
+#
+# `priority = -1` on a group is load-bearing: without it the per-lint `allow`
+# entries below are re-enabled by the group and the allow-list silently does
+# nothing.
+
+[workspace.lints.rust]
+unsafe_code = "warn"                     # opt in deliberately; see the note at the bottom
+unsafe_op_in_unsafe_fn = "deny"          # edition-2024 default, pinned for older editions
+missing_docs = "warn"                    # public items only — free for bin crates
+missing_debug_implementations = "warn"   # public types are Debug
+unreachable_pub = "warn"                 # catches `pub` that was meant to be `pub(crate)`
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+non_ascii_idents = "deny"                # homoglyph / trojan-source defense
+unused_must_use = "deny"                 # dropping a Result is never intentional
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "warn"
+missing_crate_level_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# ── pedantic opt-outs: style opinions, not defects ────────────────────────────
+module_name_repetitions = "allow"    # `net::NetConfig` is fine and often clearer
+must_use_candidate = "allow"         # fires on nearly every getter
+missing_errors_doc = "allow"         # doc the error type once, not per fn
+missing_panics_doc = "allow"         # panics are bugs (M-PANIC-ON-BUG), not API surface
+cast_precision_loss = "allow"        # u64 -> f64 is almost always intended
+struct_excessive_bools = "allow"     # config structs legitimately have flags
+similar_names = "allow"              # flags `src`/`dst`
+too_many_lines = "allow"             # budget-status.sh owns the LOC ratchet
+implicit_hasher = "allow"            # forces a generic param on every pub HashMap fn
+unnecessary_debug_formatting = "allow" # `{:?}` on Path is the readable choice
+
+# ── restriction: cherry-picked, each catches a real defect class ──────────────
+# Panic surface. Tests are exempted via clippy.toml. Deliberately NOT listed:
+# get_unwrap, unwrap_in_result and panic_in_result_fn all fire on code that
+# `unwrap_used`/`panic` already flag — verified on a probe crate, where one
+# `.get(0).unwrap()` tripped three lints at once. One finding per defect.
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"            # `v[i]` panics; `.get(i)` does not
+string_slice = "warn"                # `&s[..n]` panics on a UTF-8 boundary
+
+# Silent failure.
+unused_result_ok = "warn"            # `.ok();` throws the error away
+let_underscore_must_use = "warn"
+map_err_ignore = "warn"              # `map_err(|_| ..)` drops the cause
+assertions_on_result_states = "warn" # `assert!(r.is_ok())` hides the error
+
+# Unsafe hygiene. Inert in crates with `unsafe_code = "warn"`, load-bearing in
+# the ones that opt out.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+mem_forget = "warn"
+
+# Numbers. `float_cmp` comes from pedantic and already covers the const case.
+
+# Complexity soft cap. The one nursery lint we take — it makes clippy the
+# single source for complexity, so no second tool and no second compile.
+# Threshold lives in clippy.toml.
+cognitive_complexity = "warn"
+
+# Explicit over magic.
+clone_on_ref_ptr = "warn"            # `Arc::clone(&x)` says what it costs
+rc_mutex = "warn"                    # `Rc<Mutex<_>>` is a design error
+dbg_macro = "warn"
+
+# Lint suppression is itself reviewable (M-LINT-OVERRIDE-EXPECT).
+allow_attributes = "warn"                # use `#[expect]`: it warns once it's stale
+allow_attributes_without_reason = "warn" # every override states why
+
+# ── deliberately NOT enabled ─────────────────────────────────────────────────
+# nursery         — as a group; unstable by definition, false positives erode
+#                   trust. `cognitive_complexity` is taken individually above.
+# restriction     — as a group; contradictory by design
+# print_stdout / print_stderr — a CLI's stdout IS its output. Services should
+#                   turn these on locally and route through `tracing` instead.
+# expect_used     — `.expect("reason")` with a real reason is documentation
+# unsafe_code     — a crate that needs unsafe CANNOT override this in its own
+#                   manifest: under `[lints] workspace = true` cargo refuses
+#                   with "cannot override `workspace.lints` in `lints`", and
+#                   dropping the inherit to get the override back costs the
+#                   crate every other lint here. Do it in the source instead --
+#                   `#![expect(unsafe_code, reason = "...")]` at the crate root,
+#                   or an `#[expect]` per unsafe block, which is better: it
+#                   names each site and rustc tells you when one stops being
+#                   needed. The hygiene lints above then carry the weight.

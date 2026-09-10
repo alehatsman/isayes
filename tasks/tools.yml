@@ -1,0 +1,35 @@
+---
+description: check out rust-quality and install the three tools its gate runs
+
+steps:
+  # The pin lives here and nowhere else in this repo (D6). Bump it in one place.
+  #
+  # `vars`, not a prop default: a prop's default is taken as written and never
+  # rendered, so `{{ home }}` in one would stay four braces.
+  - vars:
+      rq_ref: v0.3.0
+      rq_dir: "{{ home }}/.cache/provision/tools/rust-quality"
+
+  - name: "rust-quality at {{ rq_ref }}"
+    git:
+      repo: https://github.com/alehatsman/rust-quality.git
+      dest: "{{ rq_dir }}"
+      ref: "{{ rq_ref }}"
+
+  # rq/tools: cargo-nextest, cargo-deny, cargo-machete, plus the clippy and
+  # rustfmt rustup components. From source unless cargo-binstall is present, so
+  # a cold first run is slow and says so.
+  #
+  # Not a `use:` of the preset. The preset's install step is ungated by design
+  # — it changes real state and cannot say in advance whether it will — and the
+  # `creates` gate below is this repo's answer to "an interrupted install
+  # should be retried, not skipped". A `use` site cannot reach inside to add
+  # it, so the two steps stay here and the preset stays honest.
+  - name: Install the gate's tools
+    shell: bash "{{ rq_dir }}/scripts/tools.sh" install
+    creates: "{{ home }}/.cargo/bin/cargo-machete"
+    timeout: 30m
+
+  - name: Verify the gate's tools
+    shell: bash "{{ rq_dir }}/scripts/tools.sh" check
+    changed_when: "false"

@@ -1,0 +1,12 @@
+---
+description: build the release binary for this machine
+
+# One binary, built natively on the machine that will run it. There is no
+# cross-compilation here and no Windows target (D4).
+steps:
+  - name: cargo build --release
+    shell: cargo build --release
+    # This step's exit code is its whole contract — there is no state to
+    # inspect and nothing for provision to be unsure about — so it says so.
+    changed_when: "false"
+    timeout: 20m

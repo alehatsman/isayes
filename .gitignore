@@ -1,0 +1,4 @@
+/target
+
+# rq/findings writes here; the JSONL is an artifact, not a source file.
+/.gate
