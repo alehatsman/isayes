@@ -70,9 +70,14 @@ pub enum Action {
 #[derive(Debug, Clone, Copy)]
 struct Countdown {
     ends_at: Instant,
-    /// Buffer length when the countdown began. Spec §8 — everything before it
-    /// is the dialog being answered, everything after arrived while detection
-    /// was switched off.
+    /// How many bytes had passed through when the countdown began. Spec §8 —
+    /// everything before it is the dialog being answered, everything after
+    /// arrived while detection was switched off.
+    ///
+    /// A **stream** position, not a buffer index: the buffer is trimmed from
+    /// the front at [`BUFFER_CAP`], so an index taken before a trim points at
+    /// the wrong bytes after one. Held as `dropped + buffer.len()` and read
+    /// back through [`Engine::dropped`].
     watermark: usize,
 }
 
@@ -93,6 +98,9 @@ pub struct Engine {
     /// PTY carries bytes that are not text at all. Detection sees a lossy
     /// conversion, which is harmless — every indicator in §6 is ASCII.
     buffer: Vec<u8>,
+    /// Bytes dropped off the front of `buffer` since the start, so a
+    /// [`Countdown::watermark`] survives a trim. Monotonic.
+    dropped: usize,
     countdown: Option<Countdown>,
     approvals: u32,
     flash: Option<Flash>,
@@ -103,9 +111,20 @@ pub struct Engine {
     /// What the detector last concluded, for the debug log (§15). The engine
     /// does no I/O, so it remembers and `main` writes.
     last_detection: Option<Detection>,
+    /// The last conclusion actually handed to the log. A detection identical
+    /// to this one is not offered again: the watchdog re-reads the same buffer
+    /// five times a second, and a partial dialog sitting there would otherwise
+    /// write the same `below score=2` line 18 000 times an hour — drowning the
+    /// one signal §15 exists to provide.
+    logged: Option<Detection>,
+    /// Scoring is cached until the buffer changes. Nothing about the same
+    /// bytes scores differently a tick later, and `is_prompt` allocates.
+    scored: Option<Detection>,
     /// When the last answer went out, for [`ANSWER_COOLDOWN`].
     answered_at: Option<Instant>,
-    last_output: Instant,
+    /// `None` until the first event. The idle timer runs from something that
+    /// happened, not from a clock the engine is not allowed to read (D8).
+    last_output: Option<Instant>,
     /// `None` until the first rescue. Seeding it with the start time would be
     /// claiming a rescue that never happened, and would hold the first real one
     /// off for the cooldown instead of the idle threshold.
@@ -113,26 +132,39 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// `delay` in seconds, `started` as the origin for the idle timers.
+    /// `delay` in seconds. Takes no origin: the idle timers start at the first
+    /// event, so nothing here reads the clock (D8).
     #[must_use]
-    pub fn new(delay: u8, started: Instant) -> Self {
+    pub fn new(delay: u8) -> Self {
         Self {
             auto_approve: true,
             delay: delay.min(MAX_DELAY),
             buffer: Vec::new(),
+            dropped: 0,
             countdown: None,
             approvals: 0,
             flash: None,
             input: InputParser::new(),
             last_detection: None,
+            logged: None,
+            scored: None,
             answered_at: None,
-            last_output: started,
+            last_output: None,
             last_rescue: None,
         }
     }
 
     /// Feed one event, get back what should happen.
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
+        // The idle clock starts at the first thing that happened, whatever it
+        // was — otherwise the first rescue is measured from an origin nobody
+        // supplied.
+        if self.last_output.is_none()
+            && let Some(stamp) = event.stamp()
+        {
+            self.last_output = Some(stamp);
+        }
+
         match event {
             Event::Output(bytes, now) => self.on_output(&bytes, now),
             Event::Input(bytes, now) => self.on_input(&bytes, now),
@@ -159,11 +191,12 @@ impl Engine {
     // ── events ───────────────────────────────────────────────────────────────
 
     fn on_output(&mut self, bytes: &[u8], now: Instant) -> Vec<Action> {
-        self.last_output = now;
+        self.last_output = Some(now);
         self.buffer.extend_from_slice(bytes);
         if self.buffer.len() > BUFFER_CAP {
-            self.buffer.drain(..self.buffer.len() - BUFFER_CAP);
+            self.discard(self.buffer.len() - BUFFER_CAP);
         }
+        self.scored = None;
 
         if self.auto_approve
             && self.countdown.is_none()
@@ -280,7 +313,9 @@ impl Engine {
 
         // A dialog Claude has already painted emits no further bytes, so
         // nothing would re-enter detection on its own. Shake the tree.
-        if now.duration_since(self.last_output) >= IDLE
+        if self
+            .last_output
+            .is_some_and(|last| now.duration_since(last) >= IDLE)
             && self
                 .last_rescue
                 .is_none_or(|last| now.duration_since(last) >= RESCUE_COOLDOWN)
@@ -294,11 +329,19 @@ impl Engine {
 
     // ── answering ────────────────────────────────────────────────────────────
 
-    fn start_countdown(&mut self, now: Instant) -> Vec<Action> {
+    /// Arm a countdown over everything in the buffer right now. The one place
+    /// the `ends_at`/`watermark` rule is written — [`toggle`](Self::toggle)
+    /// arms one too, and a watermark fix applied to only one of them would
+    /// compile.
+    fn arm_countdown(&mut self, now: Instant) {
         self.countdown = Some(Countdown {
             ends_at: now + Duration::from_secs(u64::from(self.delay)),
-            watermark: self.buffer.len(),
+            watermark: self.dropped + self.buffer.len(),
         });
+    }
+
+    fn start_countdown(&mut self, now: Instant) -> Vec<Action> {
+        self.arm_countdown(now);
         // A zero delay answers in this same turn rather than waiting a tick.
         if self.delay == 0 {
             return self.answer(now);
@@ -311,17 +354,22 @@ impl Engine {
         let watermark = self
             .countdown
             .take()
-            .map_or(self.buffer.len(), |c| c.watermark);
+            .map_or(self.dropped + self.buffer.len(), |c| c.watermark);
         self.approvals += 1;
         self.answered_at = Some(now);
 
-        // Decided from the *whole* buffer, before the truncation below.
+        // Decided before the truncation below, from the same tail the score
+        // was read off (§6) — not from scrollback the detector never saw.
         let wants_word = detector::needs_yes(&self.text());
 
         // Truncate, do not clear: what came after the watermark arrived while
-        // detection was off and may be a second dialog (§8).
-        let cut = watermark.min(self.buffer.len());
-        self.buffer.drain(..cut);
+        // detection was off and may be a second dialog (§8). The watermark is
+        // a stream position, so what is still in the buffer is whatever the
+        // front-trim has not already taken.
+        let cut = watermark
+            .saturating_sub(self.dropped)
+            .min(self.buffer.len());
+        self.discard(cut);
 
         let bytes = if wants_word {
             b"yes\r".to_vec()
@@ -350,10 +398,7 @@ impl Engine {
         // than answered even at `delay == 0` — the tick that follows fires it,
         // and the deliberate keypress deserves one frame of "about to".
         if !self.buffer.is_empty() && self.buffer_is_prompt() {
-            self.countdown = Some(Countdown {
-                ends_at: now + Duration::from_secs(u64::from(self.delay)),
-                watermark: self.buffer.len(),
-            });
+            self.arm_countdown(now);
         }
         self.flash("✓ Auto-approve ENABLED", "32", now, FLASH)
     }
@@ -438,17 +483,40 @@ impl Engine {
         String::from_utf8_lossy(&self.buffer).into_owned()
     }
 
+    /// Drop `n` bytes off the front, keeping [`Engine::dropped`] true. The
+    /// only place the buffer shrinks — a `drain` that forgot to count would
+    /// silently move every live watermark.
+    fn discard(&mut self, n: usize) {
+        let n = n.min(self.buffer.len());
+        self.buffer.drain(..n);
+        self.dropped += n;
+        self.scored = None;
+    }
+
     fn buffer_is_prompt(&mut self) -> bool {
+        // The watchdog asks on every tick. Unchanged bytes score the same, so
+        // the answer is remembered rather than rebuilt — `is_prompt` copies
+        // the whole buffer twice over and runs four regexes on it.
+        if let Some(detection) = &self.scored {
+            return detection.detected;
+        }
+
         let detection = detector::is_prompt(&self.text());
         let detected = detection.detected;
-        self.last_detection = Some(detection);
+        if self.logged.as_ref() != Some(&detection) {
+            self.last_detection = Some(detection.clone());
+        }
+        self.scored = Some(detection);
         detected
     }
 
-    /// What the detector last concluded. `main` logs it; nothing else reads it.
+    /// What the detector last concluded, if it is news. `main` logs it;
+    /// nothing else reads it.
     #[must_use]
     pub fn take_detection(&mut self) -> Option<Detection> {
-        self.last_detection.take()
+        let detection = self.last_detection.take()?;
+        self.logged = Some(detection.clone());
+        Some(detection)
     }
 }
 
@@ -509,7 +577,7 @@ mod tests {
     #[test]
     fn i1_the_engine_does_not_sit_in_the_output_path() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         let actions = out(&mut e, t0, 1, "compiling 1 of 40\nhello world\n");
         assert!(actions.is_empty(), "acted on plain output: {actions:?}");
     }
@@ -522,7 +590,7 @@ mod tests {
     #[test]
     fn i2_one_dialog_is_answered_exactly_once() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 1);
 
@@ -536,7 +604,7 @@ mod tests {
     #[test]
     fn i3_nothing_is_answered_while_auto_approve_is_off() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
 
         assert_eq!(n_answers(&out(&mut e, t0, 2, DIALOG)), 0);
@@ -551,7 +619,7 @@ mod tests {
     #[test]
     fn i4_a_dialog_split_across_two_reads_still_answers_once() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         // Split right before the "No" button: the yes/no pair scores 5 only
         // when both halves are present, so the head alone must score nothing.
@@ -574,7 +642,7 @@ mod tests {
     #[test]
     fn i5_noise_before_a_dialog_does_not_blind_detection() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         let noise = "x".repeat(5_000);
         assert_eq!(n_answers(&out(&mut e, t0, 1, &noise)), 0);
@@ -598,7 +666,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let mut e = Engine::new(0, t0);
+            let mut e = Engine::new(0);
             let actions = out(&mut e, t0, 1, text);
             assert_eq!(
                 n_answers(&actions),
@@ -621,7 +689,7 @@ mod tests {
     #[test]
     fn i7_a_word_dialog_is_answered_with_yes_then_cr_in_one_write() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         let actions = out(&mut e, t0, 1, "Do you want to proceed? (y/n)");
         assert_eq!(answers(&actions), vec![b"yes\r".to_vec()]);
@@ -630,7 +698,7 @@ mod tests {
     #[test]
     fn i7_a_button_dialog_is_answered_with_a_bare_cr() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         let actions = out(&mut e, t0, 1, DIALOG);
         assert_eq!(answers(&actions), vec![b"\r".to_vec()]);
@@ -643,7 +711,7 @@ mod tests {
     #[test]
     fn i8_a_failed_write_does_not_retry_and_the_loop_keeps_serving() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 1);
 
         let failed = e.handle(Event::AnswerFailed(at(t0, 2)));
@@ -665,7 +733,7 @@ mod tests {
     #[test]
     fn i9_a_cancelled_countdown_re_detects() {
         let t0 = origin();
-        let mut e = Engine::new(5, t0);
+        let mut e = Engine::new(5);
 
         assert_eq!(
             n_answers(&out(&mut e, t0, 1, DIALOG)),
@@ -695,7 +763,7 @@ mod tests {
     #[test]
     fn i10_sequential_dialogs_each_get_their_own_answer() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         // Spaced past the cooldown (D12) — a genuine second dialog cannot
         // appear while the child is still processing the first answer.
@@ -717,7 +785,7 @@ mod tests {
     #[test]
     fn i11_overlapping_dialogs_coalesce_and_never_deadlock() {
         let t0 = origin();
-        let mut e = Engine::new(1, t0);
+        let mut e = Engine::new(1);
 
         let mut sent = 0;
         for i in 0..8 {
@@ -744,7 +812,7 @@ mod tests {
     #[test]
     fn ordinary_keystrokes_are_forwarded_verbatim_in_one_write() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         let actions = e.handle(Event::Input(b"ls -la\r".to_vec(), at(t0, 1)));
         assert_eq!(actions, vec![Action::Forward(b"ls -la\r".to_vec())]);
     }
@@ -755,7 +823,7 @@ mod tests {
     #[test]
     fn a_bracketed_paste_is_forwarded_as_one_write() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         let actions = e.handle(Event::Input(b"\x1b[200~hello\x1b[201~".to_vec(), at(t0, 1)));
         assert_eq!(
             actions,
@@ -770,7 +838,7 @@ mod tests {
     #[test]
     fn a_focus_event_during_a_countdown_does_not_cancel_it() {
         let t0 = origin();
-        let mut e = Engine::new(5, t0);
+        let mut e = Engine::new(5);
         assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 0);
 
         let actions = e.handle(Event::Input(b"\x1b[O".to_vec(), at(t0, 50)));
@@ -785,7 +853,7 @@ mod tests {
     #[test]
     fn a_query_reply_during_a_countdown_is_forwarded_and_does_not_cancel() {
         let t0 = origin();
-        let mut e = Engine::new(5, t0);
+        let mut e = Engine::new(5);
         out(&mut e, t0, 1, DIALOG);
 
         let actions = e.handle(Event::Input(b"\x1b[?62;1;6c".to_vec(), at(t0, 50)));
@@ -799,7 +867,7 @@ mod tests {
     fn ctrl_a_toggles_in_the_encoded_forms_too() {
         let t0 = origin();
         for form in [&b"\x1b[27;5;97~"[..], &b"\x1b[97;5u"[..]] {
-            let mut e = Engine::new(0, t0);
+            let mut e = Engine::new(0);
             let actions = e.handle(Event::Input(form.to_vec(), at(t0, 1)));
             assert!(
                 !actions.iter().any(|a| matches!(a, Action::Forward(_))),
@@ -814,7 +882,7 @@ mod tests {
     #[test]
     fn enter_without_a_countdown_reaches_the_child() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         let actions = e.handle(Event::Input(b"\r".to_vec(), at(t0, 1)));
         assert_eq!(actions, vec![Action::Forward(b"\r".to_vec())]);
     }
@@ -824,7 +892,7 @@ mod tests {
     #[test]
     fn a_lone_escape_is_resolved_on_the_next_tick() {
         let t0 = origin();
-        let mut e = Engine::new(5, t0);
+        let mut e = Engine::new(5);
         out(&mut e, t0, 1, DIALOG);
 
         assert!(
@@ -842,14 +910,14 @@ mod tests {
     #[test]
     fn an_empty_read_does_nothing() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         assert!(e.handle(Event::Input(Vec::new(), at(t0, 1))).is_empty());
     }
 
     #[test]
     fn ctrl_a_is_never_forwarded() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         let actions = e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
         assert!(!actions.iter().any(|a| matches!(a, Action::Forward(_))));
     }
@@ -857,7 +925,7 @@ mod tests {
     #[test]
     fn enter_during_a_countdown_answers_now() {
         let t0 = origin();
-        let mut e = Engine::new(60, t0);
+        let mut e = Engine::new(60);
         assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 0);
 
         let actions = e.handle(Event::Input(b"\r".to_vec(), at(t0, 50)));
@@ -867,7 +935,7 @@ mod tests {
     #[test]
     fn ctrl_up_and_down_move_the_delay_and_are_silent_at_the_bounds() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         // Floor: already 0, so nothing happens and nothing is drawn.
         assert!(
@@ -888,7 +956,7 @@ mod tests {
     #[test]
     fn the_delay_keys_are_ignored_while_a_countdown_runs() {
         let t0 = origin();
-        let mut e = Engine::new(5, t0);
+        let mut e = Engine::new(5);
         out(&mut e, t0, 1, DIALOG);
 
         // Spec §9: during a countdown, any key that is not Enter cancels.
@@ -902,7 +970,7 @@ mod tests {
     #[test]
     fn toggling_off_then_on_with_a_dialog_waiting_starts_a_countdown() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
         e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
         assert_eq!(n_answers(&out(&mut e, t0, 2, DIALOG)), 0);
@@ -920,7 +988,7 @@ mod tests {
     #[test]
     fn the_countdown_rounds_seconds_up() {
         let t0 = origin();
-        let mut e = Engine::new(3, t0);
+        let mut e = Engine::new(3);
         out(&mut e, t0, 0, DIALOG);
 
         // 2.4 s left reads as 3, not 2: the bar never shows the same number
@@ -939,7 +1007,7 @@ mod tests {
     #[test]
     fn the_bar_says_off_when_it_is_off() {
         let t0 = origin();
-        let mut e = Engine::new(7, t0);
+        let mut e = Engine::new(7);
         e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
 
         // Past the flash, the steady text returns.
@@ -957,16 +1025,97 @@ mod tests {
         );
     }
 
+    /// The watermark is a stream position, not a buffer index (§8).
+    ///
+    /// A countdown long enough to span a [`BUFFER_CAP`] trim used to answer
+    /// and then truncate by the *old* index, which by then pointed past the
+    /// answered dialog and into whatever arrived after it — destroying a
+    /// second dialog the wrapper had promised to keep.
+    #[test]
+    fn a_buffer_trim_during_a_countdown_does_not_eat_the_next_dialog() {
+        let t0 = origin();
+        let mut e = Engine::new(5);
+
+        // Long lines, so the second dialog stays inside the 50-line tail.
+        let line = format!("{}\n", "x".repeat(69));
+        let second = format!("{DIALOG}{}", line.repeat(40));
+
+        // Fill to just under the cap, ending in a dialog: countdown armed.
+        let first = format!("{}{DIALOG}", "y".repeat(9_000 - DIALOG.len()));
+        assert_eq!(n_answers(&out(&mut e, t0, 1, &first)), 0);
+
+        // The second dialog arrives during the countdown and pushes the
+        // buffer over the cap, so the front is trimmed under the watermark.
+        out(&mut e, t0, 100, &second);
+
+        // The countdown fires and truncates to the watermark.
+        assert_eq!(n_answers(&ticks(&mut e, t0, 5_200, 1)), 1);
+
+        // Past the answer cooldown, what survived is the second dialog whole
+        // — so the watchdog finds it and it gets its own answer.
+        ticks(&mut e, t0, 5_800, 1);
+        assert_eq!(
+            n_answers(&ticks(&mut e, t0, 11_000, 1)),
+            1,
+            "the second dialog was truncated away with the first"
+        );
+    }
+
+    /// D11, the other half of the focus-event story. A paste is not typing:
+    /// no byte of it was a keypress, so no byte of it cancels — and the first
+    /// character must not disappear into a cancel that should not happen.
+    #[test]
+    fn a_paste_during_a_countdown_neither_cancels_nor_loses_a_byte() {
+        let t0 = origin();
+        let mut e = Engine::new(5);
+        out(&mut e, t0, 1, DIALOG);
+
+        let actions = e.handle(Event::Input(
+            b"\x1b[200~hello\x1b[201~".to_vec(),
+            at(t0, 50),
+        ));
+        assert_eq!(
+            actions,
+            vec![Action::Forward(b"\x1b[200~hello\x1b[201~".to_vec())],
+            "the paste must reach the child whole"
+        );
+        assert_eq!(n_answers(&ticks(&mut e, t0, 5_200, 2)), 1, "cancelled");
+    }
+
+    /// §15. The watchdog re-reads the same buffer five times a second; a
+    /// conclusion that has not changed is not news, and a log that repeats it
+    /// is a log nobody can read when it matters.
+    #[test]
+    fn an_unchanged_conclusion_is_offered_to_the_log_once() {
+        let t0 = origin();
+        let mut e = Engine::new(0);
+
+        // Scores below the threshold, so nothing is answered and the buffer
+        // sits there being re-examined.
+        out(&mut e, t0, 1, " Esc to cancel\n");
+        assert!(e.take_detection().is_some(), "the first look is news");
+
+        ticks(&mut e, t0, 200, 20);
+        assert!(
+            e.take_detection().is_none(),
+            "the same conclusion was offered again"
+        );
+    }
+
     // ── watchdog, §11 ────────────────────────────────────────────────────────
 
     /// A painted dialog emits no further bytes, so nothing re-enters detection
     /// on its own. After two seconds of silence the engine shakes the tree.
+    ///
+    /// The two seconds run from the first event, not from `t0`: the engine is
+    /// handed no origin because it is not allowed to read the clock (D8), so
+    /// the tick at 0.2 s is what starts the idle timer.
     #[test]
     fn silence_triggers_one_rescue_redraw_and_then_backs_off() {
         let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
 
-        let quiet = ticks(&mut e, t0, 200, 10); // 0.2 s .. 2.0 s
+        let quiet = ticks(&mut e, t0, 200, 11); // 0.2 s .. 2.2 s
         let redraws = quiet
             .iter()
             .filter(|a| matches!(a, Action::ForceRedraw))
@@ -974,7 +1123,7 @@ mod tests {
         assert_eq!(redraws, 1, "expected exactly one rescue in the first 2 s");
 
         // The cooldown holds the next one off for three seconds.
-        let soon = ticks(&mut e, t0, 2_200, 5);
+        let soon = ticks(&mut e, t0, 2_400, 5);
         assert_eq!(
             soon.iter()
                 .filter(|a| matches!(a, Action::ForceRedraw))
@@ -987,8 +1136,7 @@ mod tests {
 
     #[test]
     fn a_fatal_signal_exits_with_128_plus_the_signal() {
-        let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         assert_eq!(e.handle(Event::Terminate(2)), vec![Action::Exit(130)]);
     }
 
@@ -996,8 +1144,7 @@ mod tests {
     /// nothing to add.
     #[test]
     fn eof_is_the_callers_business() {
-        let t0 = origin();
-        let mut e = Engine::new(0, t0);
+        let mut e = Engine::new(0);
         assert!(e.handle(Event::Eof).is_empty());
     }
 }

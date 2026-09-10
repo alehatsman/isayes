@@ -67,8 +67,16 @@ outside the loop:
 
 Startup order, each step failing the process (§12) rather than degrading:
 
+0. Register the signal handlers. **Before anything is acquired**: once raw mode
+   is on, a `SIGTERM` still carrying its default disposition kills the process
+   with no teardown and leaves the shell raw and boxed in (§13 I13). There must
+   be no window between taking the terminal and being able to give it back.
+   Registration and consumption are separate steps — the handlers go on here,
+   the thread that drains them starts with the other producers.
 1. Size the PTY from the real terminal: `rows = height - STATUS_ROWS`
-   (floor 1), `cols = width`. The reserved rows are §7.
+   (floor 1), `cols = width`. The reserved rows are §7. Raw mode is enabled
+   before the size is read, so the object that restores it must exist before
+   the read can fail.
 2. Spawn `claude` with the pass-through args on the PTY.
 3. Put stdin in raw mode.
 4. Clear the screen (`ESC[2J ESC[H`), apply the scroll region, draw the bar.
@@ -178,7 +186,16 @@ defaults agree, and the danger is an implementer "fixing" them:
   a button dialog reads as a prompt edit. The corpus pins this case.
 
 `needs_yes(buffer)` — case-insensitive `Type.*yes | Enter.*yes | \(y/n\)` on
-the stripped buffer. It decides the answer's bytes, nothing else.
+**the same stripped 50-line tail `is_prompt` scores**. It decides the answer's
+bytes, nothing else.
+
+The tail is not an optimisation here, it is correctness. Run over the whole
+10 000-byte buffer — which is what this section used to say, and what the code
+did — `needs_yes` reads scrollback the detector never looked at: a `type yes to
+confirm` printed two hundred lines ago is still in the buffer, and it turns an
+ordinary button dialog's `\r` into a literal `yes` that the dialog reads as an
+edit to the prompt. Deciding the answer from bytes that did not contribute to
+the detection is the bug. The two read the same window.
 
 ## 7. Terminal ownership
 
@@ -266,8 +283,8 @@ State: `auto_approve: bool` (starts **on**), `countdown: Option<Countdown>`,
 
 **Start.** On new output, with `auto_approve` on and no countdown running, if
 `is_prompt` holds: start a countdown ending `delay` seconds out and record the
-**watermark** — the buffer's length at that instant. `delay == 0` answers in
-the same turn rather than waiting a tick.
+**watermark** — how many bytes have passed through at that instant. `delay ==
+0` answers in the same turn rather than waiting a tick.
 
 **Fire.** On the tick that reaches the deadline, or on `Enter` during the
 countdown.
@@ -275,7 +292,7 @@ countdown.
 **Answer**, in order:
 
 1. Clear the countdown, `approvals += 1`.
-2. Decide `needs_yes` from the *whole* buffer.
+2. Decide `needs_yes` from the same 50-line tail the score came from (§6).
 3. Truncate the buffer to the bytes **after the watermark**.
 4. Write `yes\r`, or `\r`, to the PTY. `yes` and the `\r` go in one write, in
    that order.
@@ -287,6 +304,16 @@ answered; keeping it would re-detect and re-answer the same dialog forever.
 Everything after it arrived while the countdown was running, when detection was
 switched off — it may be a second dialog, and dropping it would lose an answer.
 Truncation, not a clear.
+
+**A stream position, not a buffer index.** The buffer is trimmed from the front
+at `BUFFER_CAP` (§5), and a countdown can outlive a trim: a `--delay 5` over a
+noisy build easily does. An index taken before the trim points at different
+bytes after it, and truncating by it eats past the answered dialog into
+whatever came next — destroying exactly the second dialog the paragraph above
+promises to keep. Hold `dropped + buffer.len()`, where `dropped` counts every
+byte ever removed from the front, and read it back as
+`watermark - dropped`. There is one place bytes leave the front of the buffer,
+and it is the same place `dropped` is incremented.
 
 A failed PTY write flashes `✗ Failed to send approval` and returns. It never
 retries — the loop must not spin on a dead child (§13 I8).
@@ -346,9 +373,18 @@ Two rules follow, and both are corrections rather than additions:
    recent xterm. It works in Terminal.app, which implements neither, which is
    presumably why cry-aye never noticed.
 
-Both are D11. Neither is solvable by adding byte patterns to the table above:
-the wrapper has to know where an escape sequence *ends* before it can decide
-what the bytes were.
+3. **A paste is terminal traffic end to end, brackets *and* content.**
+   `ESC[200~` opens a mode; everything until `ESC[201~` is pasted text and not
+   one byte of it was a keypress. Classifying only the markers as reports and
+   the content as keys costs the first character twice over: it cancels the
+   countdown, and it is swallowed by the cancel, so the child receives a paste
+   missing its first character inside intact brackets. Inside the brackets the
+   escape machine is off — a paste may legitimately contain `ESC`, `0x01`, or
+   a complete-looking CSI, and all of it is literal.
+
+All three are D11. None is solvable by adding byte patterns to the table above:
+the wrapper has to know where an escape sequence *ends* — and whether it is
+inside a paste — before it can decide what the bytes were.
 
 ## 10. Status line
 
@@ -402,7 +438,6 @@ The two are exclusive; the missed-dialog branch returns.
 | 0 | `--help`, `--version` |
 | 1 | `claude` not on PATH or PTY spawn failed; stdin is not a TTY; an unrecoverable I/O error |
 | 2 | usage error — a bad `--delay`, an unknown flag |
-| 3 | *temporary:* the wrapper is not implemented yet. Removed when §4 lands. |
 | 101 | panic — after `cleanup` |
 | 128+signo | `SIGINT`, `SIGTERM`, `SIGHUP` — after `cleanup` |
 
@@ -410,6 +445,20 @@ Two of those are deviations from cry-aye, both deliberate (D3): it exits 1 on a
 bad `--delay` and 2 on a panic. 2 is clap's code for a usage error and 101 is
 what a panicking Rust process returns on its own; overriding either would mean
 writing code whose only purpose is to disagree with the ecosystem's default.
+
+**"stdin is not a TTY" has to be checked explicitly.** crossterm falls back to
+opening `/dev/tty`, so raw mode and the size both succeed under `isayes <
+script.txt` or `echo hi | isayes` and nothing fails on its own. The stdin
+thread then reads a *file* as if every byte of it were a keystroke —
+cancelling countdowns and typing the file at the child. `isatty(0)` before raw
+mode, exit 1.
+
+**Reaping the child is bounded.** `Eof` means "the PTY read ended", which
+covers a read *error* as well as a real EOF, and a read can fail while the
+child is perfectly healthy. At that point nothing is draining its output, so it
+blocks on its next write and an unbounded `wait()` never returns — a hung
+wrapper holding raw mode with no bar and no keys. Poll for two seconds, then
+kill and reap.
 
 `SIGWINCH` is not an exit: re-read the size, resize the PTY, re-apply the
 scroll region, redraw the bar — in that order (§7).
@@ -446,11 +495,17 @@ The properties the tests exist to hold. Each one has cost a bug once.
     status rows, restored termios — on every exit path, including panic and
     signal.
 
+    Three of those paths are easy to leave open, and all three have been:
+    raw mode enabled before a fallible call whose failure returns without
+    constructing the thing that restores it; a signal arriving after raw mode
+    but before its handler is registered; and a `wait()` that never returns
+    because the child is alive and nothing is draining it. §4 step 0, §12.
+
 ## 14. Test contract
 
 - **Detector** — a loop over `tests/fixtures/detector.toml` (D9): captured real
   dialogs with a minimum score, a false-positive corpus, the quoted-dialog
-  hazard cases, `strip_ansi` pairs and `needs_yes` pairs. 27 cases, verified
+  hazard cases, `strip_ansi` pairs and `needs_yes` pairs. 30 cases, verified
   against this section as written.
 - **Engine** — construct an `Engine`, feed it `Event`s stamped with invented
   instants, assert on the `Vec<Action>` returned. No PTY, no terminal, no
