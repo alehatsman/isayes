@@ -30,15 +30,12 @@ Everyday commands are cargo aliases from `.cargo/config.toml`:
 cargo lint      cargo t      cargo doctest      cargo docs
 ```
 
-**`cargo` is not on PATH on this machine.** rustup is Homebrew's and
-`~/.cargo/bin` has no shims. Prefix every invocation:
-
-```
-PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:$PATH"
-```
-
-`rustup default stable` would fix it permanently. That is the owner's call, not
-ours.
+`cargo` was missing from PATH on this machine until 2026-09-10 — Homebrew's
+rustup links only `rustup`, and `~/.cargo/bin` had no shims. `rq/tools` fixed
+it as a side effect: its `rustup component add clippy rustfmt` regenerated the
+full proxy set. If it ever recurs, the symptom is `command -v cargo` finding
+nothing while `~/.rustup/toolchains/*/bin/cargo` exists, and the fix is
+`rustup default stable`.
 
 ## Non-negotiable
 
