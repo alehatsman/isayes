@@ -71,7 +71,8 @@ pub struct Detection {
     pub detected: bool,
     /// The additive score from spec §6's table.
     pub score: u32,
-    /// The indicators that matched, in table order.
+    /// The indicators that matched, in spec §6's table order — descending by
+    /// weight, so the debug log reads the way the table does.
     ///
     /// Not decoration. When Claude Code moves one of these strings the tool
     /// stops approving with no error at all, and this is what makes the debug
@@ -116,14 +117,6 @@ pub fn is_prompt(text: &str) -> Detection {
         actionable = true;
         hits.push("enter_to_approve");
     }
-    if tail.contains("Esc to cancel") {
-        score += 2;
-        hits.push("esc_to_cancel");
-    }
-    if tail.contains("Tab to amend") {
-        score += 2;
-        hits.push("tab_to_amend");
-    }
     if YN_AT_END.is_match(&tail) {
         score += 3;
         actionable = true;
@@ -132,6 +125,14 @@ pub fn is_prompt(text: &str) -> Detection {
     if tail.contains("Permission rule") {
         score += 3;
         hits.push("permission_rule");
+    }
+    if tail.contains("Esc to cancel") {
+        score += 2;
+        hits.push("esc_to_cancel");
+    }
+    if tail.contains("Tab to amend") {
+        score += 2;
+        hits.push("tab_to_amend");
     }
 
     Detection {
@@ -155,9 +156,15 @@ pub fn is_prompt(text: &str) -> Detection {
 ///
 /// Decides the answer's bytes and nothing else — it never gates whether an
 /// answer is sent.
+///
+/// **The same last 50 lines [`is_prompt`] scores**, and for the same reason. Run over the whole buffer it reads scrollback the detector
+/// never looked at: a `type yes to confirm` printed two hundred lines ago is
+/// still inside the 10 KB buffer, and it turns an ordinary button dialog's
+/// `\r` into a literal `yes` the dialog reads as an edit to the prompt.
 #[must_use]
 pub fn needs_yes(text: &str) -> bool {
-    NEEDS_YES.is_match(&strip_ansi(text))
+    let clean = strip_ansi(text);
+    NEEDS_YES.is_match(&tail_lines(&clean, TAIL_LINES))
 }
 
 /// The last `n` lines, rejoined. Fewer than `n` lines yields all of them.
@@ -322,6 +329,21 @@ mod tests {
         }
     }
 
+    /// `needs_yes` reads the same 50 lines the score does. Scrollback that
+    /// mentions the word must not turn a button dialog's `\r` into `yes\r`.
+    #[test]
+    fn needs_yes_ignores_scrollback_outside_the_tail() {
+        let stale = format!(
+            "Type yes to confirm\n{}1. Yes\n2. No\nEnter to approve\n",
+            "building\n".repeat(60)
+        );
+        assert!(is_prompt(&stale).detected, "the dialog itself must score");
+        assert!(
+            !needs_yes(&stale),
+            "a `yes` 60 lines back is not this dialog's"
+        );
+    }
+
     /// Spec §6: the tail is 50 lines, so volume before a dialog must not push
     /// it out of scoring range. I5 covers the loop's side of this.
     #[test]
@@ -348,8 +370,8 @@ mod tests {
             [
                 "yes_no_buttons",
                 "enter_to_approve",
-                "esc_to_cancel",
-                "permission_rule"
+                "permission_rule",
+                "esc_to_cancel"
             ]
         );
     }

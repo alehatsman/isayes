@@ -1,6 +1,6 @@
 # isayes — build plan
 
-Status: phase 0 done (`afe2003`) · phases 1–4 open · 2026-09-10
+Status: phases 0–4 built and gated · phase 1's four abuses are the only open item · 2026-09-10
 
 ## How to use this
 
@@ -17,7 +17,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 |---|---|---|---|
 | 0 — scaffold, spec, seams | `main` | seven tasks validate; gate green; corpus verified | done |
 | 1 — terminal | `feat/terminal`, `feat/run` | the four abuses below | built; abuses 1–3 not yet run by hand |
-| 2 — detector | `feat/detector` | 27 corpus cases green | done |
+| 2 — detector | `feat/detector` | 30 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
 | 3b — input (D11) | `feat/input` | hotkeys in all three encodings; reports never cancel | done |
 | 4 — wiring, cut-over | `feat/run` | a real day's work under it | wired and running; cut-over is the owner's |

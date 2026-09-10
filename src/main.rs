@@ -4,12 +4,11 @@
 //! wiring) and holds no logic of its own: the engine decides, this acts.
 
 use std::process::ExitCode;
-use std::time::Instant;
 
 use clap::Parser;
 use isayes::debug::DebugLog;
 use isayes::engine::{Action, Engine};
-use isayes::events::{Child, Event};
+use isayes::events::{Child, Event, install_signals};
 use isayes::ignore;
 use isayes::terminal::Terminal;
 
@@ -54,10 +53,17 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<u8> {
-    // Raw mode and the size first: the PTY is sized from what is left after
+    // Signals before anything is acquired. Once raw mode is on, a SIGTERM
+    // with the default disposition leaves the shell raw and boxed in; there
+    // must be no window between taking the terminal and being able to give it
+    // back (§13 I13).
+    let signals = install_signals()?;
+
+    // Raw mode and the size next: the PTY is sized from what is left after
     // the status rows (§4 step 1).
     let mut term = Terminal::acquire()?;
-    let (mut child, events) = Child::spawn(&cli.claude_args, term.pty_rows(), term.width())?;
+    let (mut child, events) =
+        Child::spawn(&cli.claude_args, term.pty_rows(), term.width(), signals)?;
 
     // The margin goes on after the spawn, because the child's first act is a
     // full-height DECSTBM reset (measured — §7). MarginWatch catches that
@@ -73,10 +79,15 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
         cli.claude_args
     ));
 
-    let mut engine = Engine::new(cli.delay, Instant::now());
+    let mut engine = Engine::new(cli.delay);
     let mut exit = 0u8;
 
     while let Ok(event) = events.recv() {
+        // The producer already stamped it. Nothing in this loop reads the
+        // clock (D8) — `grep -rn 'Instant::now' src/ | grep -v test` shows
+        // only `events.rs`, and that is what keeps the engine testable.
+        let stamp = event.stamp();
+
         // The child's bytes reach the terminal before anything looks at them.
         // Detection never sits in the output path (§5, §13 I1).
         if let Event::Output(bytes, _) = &event {
@@ -111,7 +122,8 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
                     log.line(&format!("ANSWER {bytes:?} (#{})", engine.approvals()));
                     if child.write(&bytes).is_err() {
                         log.line("ANSWER FAILED — child is gone");
-                        failed_at = Some(Instant::now());
+                        // An answer only ever comes from a stamped event.
+                        failed_at = stamp;
                     }
                 }
                 Action::Forward(bytes) => {

@@ -32,33 +32,16 @@ pub enum Unit {
     /// Acted on here (§9). Never reaches the child.
     Hotkey(Hotkey),
     /// A real keystroke. Forwarded, and cancels a running countdown.
-    Key(Vec<u8>),
-    /// Terminal-to-application traffic — a focus event, a paste marker, a
-    /// reply to something the child asked. Forwarded, and **never** cancels:
-    /// the operator did not press anything.
-    Report(Vec<u8>),
-}
-
-impl Unit {
-    /// Is this the `Enter` key, in any encoding the child may have asked for?
     ///
-    /// `Enter` is not a [`Hotkey`]: it belongs to the child except during a
-    /// countdown, and whether a countdown is running is engine state the
-    /// parser has no business knowing. So it stays a [`Unit::Key`] and the
-    /// engine asks.
-    #[must_use]
-    pub fn is_enter(&self) -> bool {
-        matches!(self, Self::Key(bytes) if is_enter(bytes))
-    }
-
-    /// The bytes to forward to the child, if any.
-    #[must_use]
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Hotkey(_) => None,
-            Self::Key(b) | Self::Report(b) => Some(b),
-        }
-    }
+    /// `Enter` is one of these, not a [`Hotkey`]: it belongs to the child
+    /// except during a countdown, and whether a countdown is running is engine
+    /// state the parser has no business knowing. The engine asks
+    /// [`is_enter`].
+    Key(Vec<u8>),
+    /// Terminal-to-application traffic — a focus event, a paste marker, the
+    /// *contents* of a paste, a reply to something the child asked. Forwarded,
+    /// and **never** cancels: the operator did not press anything.
+    Report(Vec<u8>),
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +57,24 @@ enum State {
     StringSeq,
     /// Inside a string sequence, having just seen an `ESC` that may be the ST.
     StringSeqEsc,
+    /// Between `ESC[200~` and `ESC[201~`. Everything here is pasted text, not
+    /// typing: no byte in it was a keypress, so none of it is a [`Unit::Key`]
+    /// and none of it cancels a countdown. Without this state the first
+    /// character of a paste cancels the countdown and is swallowed with it,
+    /// and the child receives a paste missing its first character inside
+    /// intact brackets.
+    ///
+    /// The escape machine is off in here by design: a paste may contain an
+    /// `ESC`, a `0x01`, or a complete-looking CSI, and all of it is literal.
+    Paste,
 }
+
+/// Starts [`State::Paste`]. Matched exactly — a paste marker has no parameters
+/// beyond the 200.
+const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// Ends it.
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Splits stdin into [`Unit`]s across read boundaries.
 #[derive(Debug, Default)]
@@ -113,10 +113,16 @@ impl InputParser {
     /// arrive or they do not. §9 binds nothing to bare `Esc`, so deciding it a
     /// read late costs nothing (D11).
     pub fn flush(&mut self) -> Vec<Unit> {
-        self.state = State::Ground;
         if self.pending.is_empty() {
+            self.state = State::Ground;
             return Vec::new();
         }
+        // A paste is not half-read, it is half-*arrived*: the terminator is
+        // still coming. Hand the child what has landed and stay in the state.
+        if self.state == State::Paste {
+            return vec![Unit::Report(std::mem::take(&mut self.pending))];
+        }
+        self.state = State::Ground;
         let bytes = std::mem::take(&mut self.pending);
         vec![Unit::Key(bytes)]
     }
@@ -129,6 +135,13 @@ impl InputParser {
     }
 
     fn step(&mut self, byte: u8, out: &mut Vec<Unit>) {
+        // Checked before the cap: a paste is legitimately longer than any
+        // sequence, and PENDING_CAP is a bound on sequences.
+        if self.state == State::Paste {
+            self.step_paste(byte, out);
+            return;
+        }
+
         if self.pending.len() >= PENDING_CAP {
             // Not a sequence. Give the bytes back rather than growing forever.
             let bytes = std::mem::take(&mut self.pending);
@@ -162,6 +175,27 @@ impl InputParser {
                     self.state = State::StringSeq;
                 }
             }
+            // Handled above, before the cap.
+            State::Paste => {}
+        }
+    }
+
+    /// Accumulate pasted text until the closing marker. Spec §9, D11.
+    fn step_paste(&mut self, byte: u8, out: &mut Vec<Unit>) {
+        self.pending.push(byte);
+        if self.pending.ends_with(PASTE_END) {
+            self.state = State::Ground;
+            out.push(Unit::Report(std::mem::take(&mut self.pending)));
+            return;
+        }
+        // A long paste is emitted in pieces rather than buffered whole. Only
+        // the bytes that could still be a prefix of the terminator are held
+        // back, so `pending` is bounded and no split ever hides the marker.
+        if self.pending.len() >= PENDING_CAP {
+            let keep = self
+                .pending
+                .split_off(self.pending.len() - (PASTE_END.len() - 1));
+            out.push(Unit::Report(std::mem::replace(&mut self.pending, keep)));
         }
     }
 
@@ -224,7 +258,12 @@ impl InputParser {
         }
         if (0x40..=0x7E).contains(&byte) {
             let bytes = std::mem::take(&mut self.pending);
-            self.state = State::Ground;
+            // The opening marker is the one sequence that changes mode.
+            self.state = if bytes == PASTE_START {
+                State::Paste
+            } else {
+                State::Ground
+            };
             out.push(classify_csi(bytes));
         }
     }
@@ -335,7 +374,7 @@ fn parse_params(body: &[u8]) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hotkey, InputParser, Unit};
+    use super::{Hotkey, InputParser, PENDING_CAP, Unit, is_enter};
 
     fn units(chunks: &[&[u8]]) -> Vec<Unit> {
         let mut parser = InputParser::new();
@@ -388,12 +427,13 @@ mod tests {
             &b"\x1b[13u"[..],
             &b"\x1b[27;1;13~"[..],
         ] {
-            let unit = one(form);
-            assert!(unit.is_enter(), "{form:?} was not recognised as Enter");
-            assert!(unit.bytes().is_some(), "{form:?} must still be forwardable");
+            let Unit::Key(bytes) = one(form) else {
+                panic!("{form:?} must stay a key, not become a hotkey or a report");
+            };
+            assert!(is_enter(&bytes), "{form:?} was not recognised as Enter");
         }
-        assert!(!one(b"a").is_enter());
-        assert!(!one(b"\x1b[A").is_enter());
+        assert!(!is_enter(b"a"));
+        assert!(!is_enter(b"\x1b[A"));
     }
 
     #[test]
@@ -431,17 +471,85 @@ mod tests {
         assert_eq!(one(b"\x1b[O"), Unit::Report(b"\x1b[O".to_vec()));
     }
 
+    /// A paste is terminal traffic end to end. Not one byte of it is a
+    /// keystroke, so not one byte of it cancels a countdown — before this, the
+    /// first character did both, and vanished into the cancel.
     #[test]
-    fn paste_markers_are_reports_and_the_paste_itself_is_not() {
+    fn a_paste_is_all_report_content_included() {
         let got = units(&[b"\x1b[200~hi\x1b[201~"]);
         assert_eq!(
             got,
             vec![
                 Unit::Report(b"\x1b[200~".to_vec()),
-                Unit::Key(b"h".to_vec()),
-                Unit::Key(b"i".to_vec()),
-                Unit::Report(b"\x1b[201~".to_vec()),
+                Unit::Report(b"hi\x1b[201~".to_vec()),
             ]
+        );
+    }
+
+    /// Pasted text is literal. An `ESC`, a `0x01`, a complete-looking CSI —
+    /// inside the brackets they are characters, not input the wrapper acts on.
+    #[test]
+    fn pasted_control_bytes_are_not_keys_or_hotkeys() {
+        let got = units(&[b"\x1b[200~a\x01b\x1b[1;5Ac\x1b[201~"]);
+        assert_eq!(
+            got,
+            vec![
+                Unit::Report(b"\x1b[200~".to_vec()),
+                Unit::Report(b"a\x01b\x1b[1;5Ac\x1b[201~".to_vec()),
+            ]
+        );
+    }
+
+    /// The terminator may be split across reads, and the pieces before it are
+    /// handed on rather than held — a paste can be larger than any buffer.
+    #[test]
+    fn a_paste_split_across_reads_keeps_every_byte_in_order() {
+        let got = units(&[b"\x1b[200~he", b"llo\x1b[2", b"01~"]);
+        let joined: Vec<u8> = got
+            .iter()
+            .flat_map(|u| match u {
+                Unit::Report(b) => b.clone(),
+                other => panic!("not a report: {other:?}"),
+            })
+            .collect();
+        assert_eq!(joined, b"\x1b[200~hello\x1b[201~");
+    }
+
+    /// A paste longer than the sequence cap is emitted in pieces, and the
+    /// closing marker still lands — the held-back bytes are exactly the ones
+    /// that could be a prefix of it.
+    #[test]
+    fn a_paste_past_the_cap_is_chunked_without_losing_the_terminator() {
+        let body = "x".repeat(PENDING_CAP * 3);
+        let mut input = b"\x1b[200~".to_vec();
+        input.extend_from_slice(body.as_bytes());
+        input.extend_from_slice(b"\x1b[201~");
+
+        let got = units(&[&input]);
+        assert!(got.len() > 2, "expected chunking, got {} units", got.len());
+        let joined: Vec<u8> = got
+            .iter()
+            .flat_map(|u| match u {
+                Unit::Report(b) => b.clone(),
+                other => panic!("not a report: {other:?}"),
+            })
+            .collect();
+        assert_eq!(joined, input);
+    }
+
+    /// The tick flushes what has arrived without ending the paste: the
+    /// terminator is still coming, and the next byte is still pasted text.
+    #[test]
+    fn flushing_mid_paste_hands_over_content_and_stays_in_the_paste() {
+        let mut parser = InputParser::new();
+        assert_eq!(
+            parser.feed(b"\x1b[200~ab"),
+            vec![Unit::Report(b"\x1b[200~".to_vec())]
+        );
+        assert_eq!(parser.flush(), vec![Unit::Report(b"ab".to_vec())]);
+        assert_eq!(
+            parser.feed(b"c\x1b[201~"),
+            vec![Unit::Report(b"c\x1b[201~".to_vec())]
         );
     }
 
@@ -533,12 +641,7 @@ mod tests {
     fn typing_is_one_unit_per_byte_and_all_forwardable() {
         let got = units(&[b"ls -la"]);
         assert_eq!(got.len(), 6);
-        assert!(got.iter().all(|u| u.bytes().is_some()));
-    }
-
-    #[test]
-    fn a_hotkey_is_never_forwarded() {
-        assert_eq!(Unit::Hotkey(Hotkey::Toggle).bytes(), None);
+        assert!(got.iter().all(|u| matches!(u, Unit::Key(_))));
     }
 
     #[test]

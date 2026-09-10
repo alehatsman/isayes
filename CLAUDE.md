@@ -4,11 +4,12 @@ A PTY wrapper for `claude` that answers its permission dialogs. Rust port of
 cry-aye (Go, at `~/projects/cry-aye` — the source of truth for behaviour and
 for the test corpus).
 
-**State: detector, engine and the margin scanner are done and tested. The
-wrapper does not run yet** — `src/main.rs` is still the CLI surface and a stub
-that exits 3. What is missing is phase 1's raw mode, PTY, bar and teardown, and
-phase 4's wiring. Check `docs/plan.md` before writing anything: roughly 1 500
-lines already exist under `src/`.
+**State: it runs.** All eight modules are built and wired — detector, engine,
+margin scanner, input parser, PTY and producer threads, status bar, debug log.
+Verified end to end against a fake `claude` and against the real one. What is
+left is `docs/plan.md`'s phase 1 gate: the four abuses, which want a human at a
+real terminal. Check `plan.md` before writing anything; roughly 3 100 lines
+already exist under `src/`.
 
 ## Read in this order
 
@@ -18,7 +19,11 @@ lines already exist under `src/`.
 2. `docs/architecture.md` — the module map and the signatures between phases.
    Fixed before code so parallel work fits together.
 3. `docs/plan.md` — phases, tasks, done-when.
-4. `docs/decisions.md` — D1–D10, settled. To overturn one, say so first.
+4. `docs/decisions.md` — D1–D12, settled. To overturn one, say so first.
+   D11 and D12 are load-bearing in the code, not background.
+5. `docs/measurements.md` — what Claude Code actually does to the screen. §7,
+   §9, D7 and D11 all rest on it; re-run `./scripts/measure.sh` after an
+   update.
 
 ## The gate
 
@@ -43,10 +48,12 @@ nothing while `~/.rustup/toolchains/*/bin/cargo` exists, and the fix is
 ## Non-negotiable
 
 - **The engine gets no I/O and no clock** (D8). `Instant::now()` belongs in
-  `events.rs` and nowhere else — `grep -rn 'Instant::now' src/ | grep -v test` should
-  show only `events.rs`. (`engine.rs` has one documented origin helper inside
-  its `#[cfg(test)]` module; tests may read the clock, the loop may not.) This
-  is what keeps the test suite deterministic and sub-second.
+  `events.rs` and nowhere else — `grep -rn 'Instant::now' src/ | grep -v
+  events.rs` should show exactly one hit, the documented `origin()` helper
+  inside `engine.rs`'s `#[cfg(test)]` module. Tests may read the clock; the
+  loop may not, and neither may `main` — it takes its instants off the event
+  it is already holding (`Event::stamp`). This is what keeps the suite
+  deterministic and sub-second.
 - **`unwrap`, `panic`, `todo!()` fail the gate** in non-test code. A stub that
   compiles green is worse than a red build.
 - **Do not hand-edit `clippy.toml`, `rustfmt.toml`, `deny.toml`,
@@ -59,6 +66,6 @@ nothing while `~/.rustup/toolchains/*/bin/cargo` exists, and the fix is
 
 ## Test data
 
-`tests/fixtures/detector.toml` — 27 cases ported from cry-aye's Go tests and
+`tests/fixtures/detector.toml` — 30 cases ported from cry-aye's Go tests and
 verified against §6 as written. Tests loop over it; new dialogs go in as
 entries, not as new test functions (D9).

@@ -154,7 +154,11 @@ cannot flake.
 
 The cost is one field on an enum variant and the discipline not to call `now()`
 in a helper. That is one careless line to reintroduce, so it is written down
-here rather than left as a style someone might notice.
+here rather than left as a style someone might notice. It *was* reintroduced,
+twice, in `main.rs` — once to give the engine an origin and once to stamp a
+failed write — and both were invisible until someone re-ran the grep. Neither
+needed a clock: the engine starts its idle timer at the first event it is
+handed, and `main` reads `Event::stamp()` off the event already in its hand.
 
 **Overturned by.** Nothing. A future feature that genuinely needs wall-clock
 inside the loop gets another stamped event.
@@ -221,6 +225,15 @@ Focus events, paste markers and query replies are bytes on stdin that are not
 keystrokes. Under §9's "any other key cancels", clicking away from the window
 during a countdown cancels the approval *and* eats a reply the child may be
 blocking on.
+
+A paste is the same problem one level down, and classifying the *markers* is
+not enough. `ESC[200~` opens a mode: everything until `ESC[201~` is pasted
+text, and no byte of it was a keypress either. Treat the content as keys and
+the first character of every paste during a countdown does double damage — it
+cancels the countdown, and the cancel swallows it, so the child receives a
+paste missing its first character inside intact brackets. The parser therefore
+carries a paste state in which the escape machine is off entirely, because
+pasted text may legitimately contain `ESC`, `0x01`, or a complete-looking CSI.
 
 **Why not just add the new byte patterns.** Because the set is open. Three
 encodings today, and a terminal may send a report at any moment, of a length

@@ -470,15 +470,28 @@ impl Terminal {
     /// Raw mode on, size read. The margin is **not** applied yet: the child
     /// resets it as its first act (measured, §7), so [`start`](Self::start)
     /// runs after the spawn.
+    ///
+    /// Fails if stdin is not a terminal (§12, exit 1). The check is not
+    /// optional politeness: crossterm falls back to opening `/dev/tty`, so
+    /// raw mode and the size both succeed on a pipe or a redirect, and the
+    /// stdin thread then reads a *file* as if every byte of it were a
+    /// keystroke — cancelling countdowns and typing the file at the child.
     pub fn acquire() -> io::Result<Self> {
+        if !io::IsTerminal::is_terminal(&io::stdin()) {
+            return Err(io::Error::other("stdin is not a terminal"));
+        }
         crossterm::terminal::enable_raw_mode()?;
-        let (width, height) = crossterm::terminal::size()?;
-        Ok(Self {
-            width,
-            height,
+        // Constructed before anything else can fail: from here on the restore
+        // is `Drop`'s, and a `?` below cannot leave the shell in raw mode
+        // (§13 I13).
+        let mut term = Self {
+            width: 0,
+            height: 0,
             watch: MarginWatch::new(),
             raw: true,
-        })
+        };
+        term.refresh_size()?;
+        Ok(term)
     }
 
     /// Clear the screen and take the scroll region. Spec §4 step 4.
