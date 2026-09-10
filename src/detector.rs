@@ -95,8 +95,7 @@ pub fn strip_ansi(text: &str) -> String {
 /// Strips first, then scores only the last 50 lines.
 #[must_use]
 pub fn is_prompt(text: &str) -> Detection {
-    let clean = strip_ansi(text);
-    let tail = tail_lines(&clean, TAIL_LINES);
+    let tail = scored_tail(text);
 
     let mut score = 0;
     // Has anything appeared that can actually be *answered*? Buttons, an
@@ -157,14 +156,20 @@ pub fn is_prompt(text: &str) -> Detection {
 /// Decides the answer's bytes and nothing else — it never gates whether an
 /// answer is sent.
 ///
-/// **The same last 50 lines [`is_prompt`] scores**, and for the same reason. Run over the whole buffer it reads scrollback the detector
-/// never looked at: a `type yes to confirm` printed two hundred lines ago is
-/// still inside the 10 KB buffer, and it turns an ordinary button dialog's
+/// Scores the same last 50 lines [`is_prompt`] does, and for the same reason:
+/// run over the whole buffer, this would read scrollback the detector never
+/// looked at. A `type yes to confirm` printed two hundred lines ago is still
+/// inside the 10 KB buffer, and it would turn an ordinary button dialog's
 /// `\r` into a literal `yes` the dialog reads as an edit to the prompt.
 #[must_use]
 pub fn needs_yes(text: &str) -> bool {
-    let clean = strip_ansi(text);
-    NEEDS_YES.is_match(&tail_lines(&clean, TAIL_LINES))
+    NEEDS_YES.is_match(&scored_tail(text))
+}
+
+/// Strip, then take the last [`TAIL_LINES`] lines — what both [`is_prompt`]
+/// and [`needs_yes`] score, kept as one place so the two cannot drift apart.
+fn scored_tail(text: &str) -> String {
+    tail_lines(&strip_ansi(text), TAIL_LINES)
 }
 
 /// The last `n` lines, rejoined. Fewer than `n` lines yields all of them.

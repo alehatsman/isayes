@@ -113,14 +113,20 @@ impl InputParser {
     /// arrive or they do not. §9 binds nothing to bare `Esc`, so deciding it a
     /// read late costs nothing (D11).
     pub fn flush(&mut self) -> Vec<Unit> {
+        // A paste is not half-read, it is half-*arrived*: the terminator is
+        // still coming. Hand the child what has landed and stay in the state
+        // — checked before the empty check below, because `pending` is empty
+        // exactly when a flush lands right after the opening marker, and that
+        // must not fall through to resetting the state to `Ground` mid-paste.
+        if self.state == State::Paste {
+            if self.pending.is_empty() {
+                return Vec::new();
+            }
+            return vec![Unit::Report(std::mem::take(&mut self.pending))];
+        }
         if self.pending.is_empty() {
             self.state = State::Ground;
             return Vec::new();
-        }
-        // A paste is not half-read, it is half-*arrived*: the terminator is
-        // still coming. Hand the child what has landed and stay in the state.
-        if self.state == State::Paste {
-            return vec![Unit::Report(std::mem::take(&mut self.pending))];
         }
         self.state = State::Ground;
         let bytes = std::mem::take(&mut self.pending);
@@ -535,6 +541,24 @@ mod tests {
             })
             .collect();
         assert_eq!(joined, input);
+    }
+
+    /// A flush landing with nothing pending, right after the opening marker,
+    /// must not reset to `Ground` — the parser is still inside the paste and
+    /// the next byte is still pasted text, not a fresh keystroke.
+    #[test]
+    fn flushing_right_after_the_paste_marker_stays_in_the_paste() {
+        let mut parser = InputParser::new();
+        assert_eq!(
+            parser.feed(b"\x1b[200~"),
+            vec![Unit::Report(b"\x1b[200~".to_vec())]
+        );
+        assert!(parser.flush().is_empty());
+        assert_eq!(
+            parser.feed(b"a\x1b[201~"),
+            vec![Unit::Report(b"a\x1b[201~".to_vec())],
+            "the byte after the flush was treated as a fresh keystroke"
+        );
     }
 
     /// The tick flushes what has arrived without ending the paste: the

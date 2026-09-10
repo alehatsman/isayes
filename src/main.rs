@@ -84,8 +84,8 @@ fn run(cli: &Cli) -> anyhow::Result<u8> {
 
     while let Ok(event) = events.recv() {
         // The producer already stamped it. Nothing in this loop reads the
-        // clock (D8) — `grep -rn 'Instant::now' src/ | grep -v test` shows
-        // only `events.rs`, and that is what keeps the engine testable.
+        // clock (D8, audited in CLAUDE.md) — that is what keeps the engine
+        // testable.
         let stamp = event.stamp();
 
         // The child's bytes reach the terminal before anything looks at them.

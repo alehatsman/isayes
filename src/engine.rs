@@ -79,6 +79,12 @@ struct Countdown {
     /// the wrong bytes after one. Held as `dropped + buffer.len()` and read
     /// back through [`Engine::dropped`].
     watermark: usize,
+    /// Whether the dialog being answered wants the literal word, decided from
+    /// the same tail that armed the countdown. Bytes that arrive *during* the
+    /// countdown are not this dialog's (§8) and must not change the answer —
+    /// deciding this at answer time instead would score whatever the buffer
+    /// has grown into by then.
+    wants_yes: bool,
 }
 
 /// A transient message that outranks the steady status text.
@@ -108,17 +114,18 @@ pub struct Engine {
     /// matching cannot see a `Ctrl+A` the terminal encoded, and cannot tell a
     /// focus event from a keypress.
     input: InputParser,
-    /// What the detector last concluded, for the debug log (§15). The engine
-    /// does no I/O, so it remembers and `main` writes.
-    last_detection: Option<Detection>,
     /// The last conclusion actually handed to the log. A detection identical
     /// to this one is not offered again: the watchdog re-reads the same buffer
     /// five times a second, and a partial dialog sitting there would otherwise
     /// write the same `below score=2` line 18 000 times an hour — drowning the
     /// one signal §15 exists to provide.
     logged: Option<Detection>,
-    /// Scoring is cached until the buffer changes. Nothing about the same
-    /// bytes scores differently a tick later, and `is_prompt` allocates.
+    /// What the detector concluded about the buffer as it stands, for the
+    /// debug log (§15) and [`Engine::buffer_is_prompt`] alike. Cached until
+    /// the buffer changes — nothing about the same bytes scores differently a
+    /// tick later, and `is_prompt` allocates. `main` compares this against
+    /// [`Engine::logged`] through [`Engine::take_detection`]; the engine does
+    /// no I/O, so it only remembers.
     scored: Option<Detection>,
     /// When the last answer went out, for [`ANSWER_COOLDOWN`].
     answered_at: Option<Instant>,
@@ -145,7 +152,6 @@ impl Engine {
             approvals: 0,
             flash: None,
             input: InputParser::new(),
-            last_detection: None,
             logged: None,
             scored: None,
             answered_at: None,
@@ -337,6 +343,7 @@ impl Engine {
         self.countdown = Some(Countdown {
             ends_at: now + Duration::from_secs(u64::from(self.delay)),
             watermark: self.dropped + self.buffer.len(),
+            wants_yes: detector::needs_yes(&self.text()),
         });
     }
 
@@ -351,16 +358,14 @@ impl Engine {
 
     /// Spec §8, in the order written there.
     fn answer(&mut self, now: Instant) -> Vec<Action> {
-        let watermark = self
+        let (watermark, wants_word) = self
             .countdown
             .take()
-            .map_or(self.dropped + self.buffer.len(), |c| c.watermark);
+            .map_or((self.dropped + self.buffer.len(), false), |c| {
+                (c.watermark, c.wants_yes)
+            });
         self.approvals += 1;
         self.answered_at = Some(now);
-
-        // Decided before the truncation below, from the same tail the score
-        // was read off (§6) — not from scrollback the detector never saw.
-        let wants_word = detector::needs_yes(&self.text());
 
         // Truncate, do not clear: what came after the watermark arrived while
         // detection was off and may be a second dialog (§8). The watermark is
@@ -503,18 +508,18 @@ impl Engine {
 
         let detection = detector::is_prompt(&self.text());
         let detected = detection.detected;
-        if self.logged.as_ref() != Some(&detection) {
-            self.last_detection = Some(detection.clone());
-        }
         self.scored = Some(detection);
         detected
     }
 
-    /// What the detector last concluded, if it is news. `main` logs it;
-    /// nothing else reads it.
+    /// What the detector concluded about the buffer, if it is news since the
+    /// last time this was called. `main` logs it; nothing else reads it.
     #[must_use]
     pub fn take_detection(&mut self) -> Option<Detection> {
-        let detection = self.last_detection.take()?;
+        let detection = self.scored.clone()?;
+        if self.logged.as_ref() == Some(&detection) {
+            return None;
+        }
         self.logged = Some(detection.clone());
         Some(detection)
     }
@@ -702,6 +707,30 @@ mod tests {
 
         let actions = out(&mut e, t0, 1, DIALOG);
         assert_eq!(answers(&actions), vec![b"\r".to_vec()]);
+    }
+
+    /// A word dialog decides its answer from the tail present when the
+    /// countdown was armed, not from whatever the buffer has grown into by
+    /// the time it fires. Further output arriving mid-countdown must not
+    /// turn `yes\r` into a bare `\r`.
+    #[test]
+    fn a_word_dialog_still_gets_yes_after_more_output_arrives_mid_countdown() {
+        let t0 = origin();
+        let mut e = Engine::new(3);
+
+        assert_eq!(
+            n_answers(&out(&mut e, t0, 1, "Do you want to proceed? (y/n)")),
+            0,
+            "delay 3 answered at once"
+        );
+
+        // Enough further output to push the original tail out of the 50-line
+        // scoring window by the time the countdown fires.
+        let noise = "building\n".repeat(60);
+        out(&mut e, t0, 100, &noise);
+
+        let fired = ticks(&mut e, t0, 3_200, 1);
+        assert_eq!(answers(&fired), vec![b"yes\r".to_vec()]);
     }
 
     // ── I8 ───────────────────────────────────────────────────────────────────
@@ -1085,6 +1114,11 @@ mod tests {
     /// §15. The watchdog re-reads the same buffer five times a second; a
     /// conclusion that has not changed is not news, and a log that repeats it
     /// is a log nobody can read when it matters.
+    ///
+    /// Each chunk below is new output, so it invalidates the scored cache and
+    /// forces a fresh score every time — unlike ticks against an unchanged
+    /// buffer, which would pass this test even with an inverted `logged`
+    /// comparison, because the cache alone would already suppress rescoring.
     #[test]
     fn an_unchanged_conclusion_is_offered_to_the_log_once() {
         let t0 = origin();
@@ -1095,7 +1129,9 @@ mod tests {
         out(&mut e, t0, 1, " Esc to cancel\n");
         assert!(e.take_detection().is_some(), "the first look is news");
 
-        ticks(&mut e, t0, 200, 20);
+        for i in 0..5 {
+            out(&mut e, t0, 200 + i * 200, " Esc to cancel\n");
+        }
         assert!(
             e.take_detection().is_none(),
             "the same conclusion was offered again"

@@ -70,6 +70,16 @@ pub const REDRAW_HOLD: Duration = Duration::from_millis(50);
 
 const READ_BUF: usize = 4096;
 
+/// A `PtySize` with no pixel dimensions — nothing here ever tracks those.
+fn pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
 /// How long [`Child::wait`] gives the child to exit on its own before killing
 /// it. Spec §12, §13 I13.
 ///
@@ -140,12 +150,7 @@ impl Child {
         cols: u16,
         signals: Signals,
     ) -> anyhow::Result<(Self, Receiver<Event>)> {
-        let pair = native_pty_system().openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let pair = native_pty_system().openpty(pty_size(rows, cols))?;
 
         let mut cmd = CommandBuilder::new("claude");
         for arg in args {
@@ -167,12 +172,7 @@ impl Child {
         spawn_ticker(tx.clone());
         spawn_signals(signals, tx);
 
-        let size = Arc::new(Mutex::new(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }));
+        let size = Arc::new(Mutex::new(pty_size(rows, cols)));
         let (restore, restore_rx) = channel();
         spawn_restore(Arc::clone(&master), Arc::clone(&size), restore_rx);
 
@@ -201,12 +201,7 @@ impl Child {
     /// This is what "the size" means from here on: a later restore reads it
     /// back, so a resize during a redraw is not undone by one.
     pub fn resize(&self, rows: u16, cols: u16) {
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
+        let size = pty_size(rows, cols);
         if let Ok(mut current) = self.size.lock() {
             *current = size;
         }
@@ -226,40 +221,45 @@ impl Child {
         if cols < 2 || rows < 1 {
             return;
         }
-        apply(
-            &self.master,
-            PtySize {
-                rows,
-                cols: cols - 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-        );
+        apply(&self.master, pty_size(rows, cols - 1));
         crate::ignore(self.restore.send(()));
     }
 
     /// Reap the child and return its exit code (§12).
     ///
     /// Bounded by a two-second grace. A child that has not gone within it is
-    /// killed rather than waited on forever.
+    /// killed rather than waited on forever — and the wait for *that* is
+    /// bounded too: a kill is not a guarantee, and an unbounded wait here
+    /// would reproduce the hang `EXIT_GRACE` exists to prevent.
     pub fn wait(&mut self) -> u8 {
-        let mut waited = Duration::ZERO;
-        while waited < EXIT_GRACE {
-            match self.process.try_wait() {
-                Ok(Some(status)) => return u8::try_from(status.exit_code()).unwrap_or(1),
-                Ok(None) => {}
-                Err(_) => return 1,
-            }
-            thread::sleep(REAP_POLL);
-            waited += REAP_POLL;
+        if let Some(code) = self.poll_wait(EXIT_GRACE) {
+            return code;
         }
         // Still running with its PTY no longer being read: it will block on
         // its next write and never exit on its own.
         self.kill();
-        match self.process.wait() {
-            Ok(status) => u8::try_from(status.exit_code()).unwrap_or(1),
-            Err(_) => 1,
+        self.poll_wait(EXIT_GRACE).unwrap_or(1)
+    }
+
+    /// Poll for up to `budget` for the child to exit, killing it if polling
+    /// itself fails — a `try_wait` error does not mean the child is gone, and
+    /// leaving it running with nothing draining its PTY is the same hang this
+    /// function exists to avoid.
+    fn poll_wait(&mut self, budget: Duration) -> Option<u8> {
+        let mut waited = Duration::ZERO;
+        while waited < budget {
+            match self.process.try_wait() {
+                Ok(Some(status)) => return Some(u8::try_from(status.exit_code()).unwrap_or(1)),
+                Ok(None) => {}
+                Err(_) => {
+                    self.kill();
+                    return Some(1);
+                }
+            }
+            thread::sleep(REAP_POLL);
+            waited += REAP_POLL;
         }
+        None
     }
 
     /// Stop the child. Used on the signal path, where we exit first.
@@ -289,8 +289,14 @@ fn spawn_restore(
             // Drain any redraws that piled up during the hold: they all want
             // the same thing, and it is about to happen once.
             while rx.try_recv().is_ok() {}
+            // A poisoned lock still holds a usable size — recovering it keeps
+            // this thread alive instead of silently abandoning every future
+            // restore because some unrelated panic happened while `resize`
+            // held the same mutex.
             let current = {
-                let Ok(guard) = size.lock() else { return };
+                let guard = size
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *guard
             };
             apply(&master, current);
