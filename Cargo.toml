@@ -24,8 +24,14 @@ codegen-units = 1
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
+regex = "1"
 # The PTY, terminal and signal crates land with the code that uses them
 # (D5) — an unused dependency fails the gate on cargo-machete, correctly.
+
+[dev-dependencies]
+# Only to read tests/fixtures/detector.toml (D9). The binary parses no TOML.
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 # rust-quality — canonical lint block.
 #

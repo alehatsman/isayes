@@ -14,6 +14,7 @@ the same commit; do not quietly widen it.
 
 | File | Owns | Spec | Depends on |
 |---|---|---|---|
+| `lib.rs` | Nothing but `pub mod` lines and the crate docs. | — | — |
 | `main.rs` | CLI, wiring, exit codes. No logic. | §3, §12 | everything |
 | `detector.rs` | Scoring output. Pure — no I/O, no state, no clock. | §6 | nothing |
 | `terminal.rs` | The real terminal and the PTY's size. Raw mode, the margin, the bar, teardown. | §7 | nothing |
@@ -21,10 +22,20 @@ the same commit; do not quietly widen it.
 | `engine.rs` | All the state and all the decisions. Pure — no I/O, no clock. | §5, §8–§11 | `detector.rs` |
 | `debug.rs` | The debug log. | §15 | nothing |
 
-Six files. If a seventh appears, it is because something above got too big, and
-that is a conversation, not a refactor to do quietly.
+Seven files. If an eighth appears, it is because something above got too big,
+and that is a conversation, not a refactor to do quietly.
 
 `engine.rs` is not called `loop.rs` because `loop` is a keyword.
+
+**Lib plus bin, and it is not ceremony** (D10). In a bin-only crate every
+module `main.rs` has not wired up yet is `dead_code`, which the gate treats as
+an error — so each phase would ship an `#[expect(dead_code)]` that
+`unfulfilled_lint_expectations` then fires on under `--all-targets`, because
+the tests *do* use the code. A library target makes the modules genuinely
+reachable, so phases land clean and in any order.
+
+The lib also means `pub`, not `pub(crate)`, is the right visibility for a
+module's surface — and `missing_docs` therefore bites, which is the point.
 
 ## The one idea
 

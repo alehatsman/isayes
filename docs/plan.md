@@ -17,7 +17,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 |---|---|---|---|
 | 0 — scaffold, spec, seams | `main` | seven tasks validate; gate green; corpus verified | done |
 | 1 — terminal | `feat/terminal` | the four abuses below | open |
-| 2 — detector | `feat/detector` | 27 corpus cases green | open |
+| 2 — detector | `feat/detector` | 27 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | open |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
 
@@ -104,13 +104,19 @@ result in the commit message.
 
 ---
 
-## Phase 2 — the detector
+## Phase 2 — the detector — **done**
 
-`detector.rs`. Spec §6. Decision D9. **Parallel with phase 1.**
+`detector.rs`. Spec §6. Decisions D9, D10. Built on `feat/detector`.
 
-Pure functions, no state, no I/O, no clock. The corpus already exists and has
-already been verified to hold against §6 as written — 27 cases, in
-`tests/fixtures/detector.toml`.
+Pure functions, no state, no I/O, no clock. 27 corpus cases plus four written
+directly: volume before a dialog, a dialog scrolled past the 50-line tail, hits
+in table order, and a load guard that fails if the corpus ever comes back empty
+rather than passing vacuously.
+
+15 tests, 0.00 s, gate green. What landed differs from the sketch below in one
+way: the crate gained a library target (D10), because a bin-only crate makes
+every not-yet-wired module `dead_code` and there is no attribute that is
+correct under both `cargo build` and `cargo lint --all-targets`.
 
 ### 2.1 — `strip_ansi`, `is_prompt`, `needs_yes`
 

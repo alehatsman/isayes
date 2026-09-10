@@ -15,7 +15,7 @@ CLI surface and a stub that exits 3.
 2. `docs/architecture.md` — the module map and the signatures between phases.
    Fixed before code so parallel work fits together.
 3. `docs/plan.md` — phases, tasks, done-when.
-4. `docs/decisions.md` — D1–D9, settled. To overturn one, say so first.
+4. `docs/decisions.md` — D1–D10, settled. To overturn one, say so first.
 
 ## The gate
 

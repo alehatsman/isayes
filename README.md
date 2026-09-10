@@ -16,7 +16,7 @@ Rust port of [cry-aye](https://github.com/alehatsman/cry-aye).
 | [docs/spec.md](docs/spec.md) | the contract — 15 sections, 13 invariants |
 | [docs/architecture.md](docs/architecture.md) | module map and the signatures between phases |
 | [docs/plan.md](docs/plan.md) | phases, tasks, done-when |
-| [docs/decisions.md](docs/decisions.md) | D1–D9 |
+| [docs/decisions.md](docs/decisions.md) | D1–D10 |
 
 ```
 isayes                          # drop-in for `claude`
