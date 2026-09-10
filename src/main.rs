@@ -1,19 +1,19 @@
 //! `isayes` — run `claude` inside a PTY and answer its permission dialogs.
 //!
-//! The contract is `docs/spec.md`. What is here is §3, the CLI surface. The
-//! event loop, the detector and the terminal (§4–§11) are not written yet;
-//! until they are, the binary parses its arguments and says so.
+//! The contract is `docs/spec.md`. This file is §3 (the CLI) and §4 (the
+//! wiring) and holds no logic of its own: the engine decides, this acts.
 
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::Parser;
-
-/// Exit code for "parsed fine, but the wrapper does not exist yet" (spec §12).
-/// Deleted along with the stub in `main`.
-const EX_NOT_IMPLEMENTED: u8 = 3;
+use isayes::engine::{Action, Engine};
+use isayes::events::{Child, Event};
+use isayes::ignore;
+use isayes::terminal::Terminal;
 
 const KEYS: &str = "\
-Keys, once the wrapper runs:
+Keys:
   Ctrl+A       toggle auto-approve
   Ctrl+Up      delay + 1s          Ctrl+Down    delay - 1s
   Enter        approve now         any key      cancel the countdown
@@ -43,54 +43,84 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    eprintln!("isayes: the wrapper is not implemented yet — see docs/spec.md §4.");
-    eprintln!(
-        "        parsed: delay={}s, claude args {:?}",
-        cli.delay, cli.claude_args
-    );
-
-    ExitCode::from(EX_NOT_IMPLEMENTED)
+    match run(&cli) {
+        Ok(code) => ExitCode::from(code),
+        Err(err) => {
+            eprintln!("isayes: {err}");
+            ExitCode::from(1)
+        }
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Cli;
-    use clap::Parser;
-    use clap::error::ErrorKind;
+fn run(cli: &Cli) -> anyhow::Result<u8> {
+    // Raw mode and the size first: the PTY is sized from what is left after
+    // the status rows (§4 step 1).
+    let mut term = Terminal::acquire()?;
+    let (mut child, events) = Child::spawn(&cli.claude_args, term.pty_rows(), term.width())?;
 
-    #[test]
-    fn delay_defaults_to_zero() {
-        assert_eq!(Cli::parse_from(["isayes"]).delay, 0);
+    // The margin goes on after the spawn, because the child's first act is a
+    // full-height DECSTBM reset (measured — §7). MarginWatch catches that
+    // reset and pass_through re-applies, which is what makes it stick.
+    term.start()?;
+
+    let mut engine = Engine::new(cli.delay, Instant::now());
+    let mut exit = 0u8;
+
+    while let Ok(event) = events.recv() {
+        // The child's bytes reach the terminal before anything looks at them.
+        // Detection never sits in the output path (§5, §13 I1).
+        if let Event::Output(bytes, _) = &event {
+            term.pass_through(bytes)?;
+        }
+
+        match &event {
+            Event::Eof => {
+                exit = child.wait();
+                break;
+            }
+            Event::Winch(_) => {
+                term.refresh_size()?;
+                child.resize(term.pty_rows(), term.width());
+                term.apply_margin()?;
+            }
+            _ => {}
+        }
+
+        let mut actions = engine.handle(event);
+        // A failed write comes back as an event rather than a retry, so the
+        // loop cannot spin on a dead child (§13 I8).
+        let mut failed_at = None;
+        for action in actions.drain(..) {
+            match action {
+                Action::Answer(bytes) => {
+                    if child.write(&bytes).is_err() {
+                        failed_at = Some(Instant::now());
+                    }
+                }
+                Action::Forward(bytes) => {
+                    // Best effort: a child that cannot be written to is a
+                    // child that is exiting, and `Eof` reports that properly a
+                    // moment later.
+                    ignore(child.write(&bytes));
+                }
+                Action::Status { text, colour } => term.draw_status(&text, colour)?,
+                Action::ForceRedraw => child.force_redraw(term.pty_rows(), term.width()),
+                Action::Exit(code) => {
+                    child.kill();
+                    return Ok(code);
+                }
+            }
+        }
+        if let Some(now) = failed_at {
+            for action in engine.handle(Event::AnswerFailed(now)) {
+                if let Action::Status { text, colour } = action {
+                    term.draw_status(&text, colour)?;
+                }
+            }
+        }
     }
 
-    #[test]
-    fn delay_accepts_the_whole_range() {
-        assert_eq!(Cli::parse_from(["isayes", "--delay", "60"]).delay, 60);
-    }
-
-    #[test]
-    fn delay_above_sixty_is_a_usage_error() {
-        let err = Cli::try_parse_from(["isayes", "--delay", "61"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn delay_below_zero_is_a_usage_error() {
-        let err = Cli::try_parse_from(["isayes", "--delay", "-1"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn trailing_args_pass_through_verbatim() {
-        let cli = Cli::parse_from(["isayes", "--", "--help"]);
-        assert_eq!(cli.claude_args, ["--help"]);
-    }
-
-    #[test]
-    fn a_bare_prompt_is_a_trailing_arg() {
-        let cli = Cli::parse_from(["isayes", "--delay", "3", "--", "fix the build"]);
-        assert_eq!(cli.delay, 3);
-        assert_eq!(cli.claude_args, ["fix the build"]);
-    }
+    Ok(exit)
+    // `term` drops here: full-height scroll region, cleared status rows, raw
+    // mode off. Also on the `?` paths above and on a panic (§13 I13).
 }

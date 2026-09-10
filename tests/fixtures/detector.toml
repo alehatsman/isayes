@@ -197,3 +197,21 @@ want = false
 name = "button dialog needs no word"
 input = "1. Yes\n2. No\nEnter to approve"
 want = false
+
+# ── a fragment is not a dialog ───────────────────────────────────────────────
+# Found by running the wrapper against a real PTY: a dialog arrives in several
+# reads, and its trailing hint line lands after the watermark. Two weak hints
+# sum to 4, over the threshold, so the same dialog was answered three times.
+# A dialog always carries one indicator worth THRESHOLD on its own.
+
+[[not_dialog]]
+name = "the trailing hint line of a dialog already answered"
+input = " Esc to cancel · Tab to amend\n"
+
+[[not_dialog]]
+name = "esc and tab hints with nothing to confirm"
+input = "some output\n Esc to cancel\n Tab to amend\n"
+
+[[not_dialog]]
+name = "permission rule header, before the buttons have rendered"
+input = " Bash command\n\n   ls -la\n\n Permission rule Bash requires confirmation.\n"

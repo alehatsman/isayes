@@ -134,9 +134,25 @@ most recent output, and a tail bounds the cost of scanning on every read.
 | `Esc to cancel` | 2 |
 | `Tab to amend` | 2 |
 
-**Threshold: `score >= 3`.** One weak indicator is never enough; the
-yes/no button pair alone is. The threshold is the whole false-positive
-defence — prose that merely *mentions* a yes/no reaches 2 at worst (§13 I6).
+**Threshold: `score >= 3`, and at least one *answerable* indicator.** Both
+conditions. The score alone is not enough, and finding that out cost a bug.
+
+An indicator is answerable if it is something you can respond to — the button
+pair, `Enter to approve` / `Enter to confirm`, `(y/n)`. `Permission rule`,
+`Esc to cancel` and `Tab to amend` are **corroborating**: they accompany a
+dialog, they are not one.
+
+Measured against a real PTY: a dialog arrives over several reads, and
+`Permission rule` lands in an earlier read than the buttons do. Scoring 3 on
+its own it was answered before there was anything to answer — and then the
+buttons arrived in the next read and were answered again. One dialog, three
+`\r`. The mirror of the same mistake is the trailing hint line, where
+`Esc to cancel` plus `Tab to amend` sums to 4 with nothing to confirm.
+
+Sending `\r` at a dialog that has not finished rendering is the worst thing
+this tool can do: the keystroke lands on whatever renders next, which nobody
+chose. The threshold is the false-positive defence for prose (§13 I6); the
+answerable requirement is the defence against a half-drawn dialog.
 
 **Known hazard, not a bug.** A code block or a transcript that reproduces a
 *complete* dialog — `1. Yes`, `2. No`, `Enter to approve` — scores like the
@@ -274,6 +290,13 @@ Truncation, not a clear.
 
 A failed PTY write flashes `✗ Failed to send approval` and returns. It never
 retries — the loop must not spin on a dead child (§13 I8).
+
+**Nothing is answered within 500 ms of the last answer** (D12). The watermark
+only discards what arrived *before* the countdown; a later read carrying a
+repaint of the dialog just answered is scored fresh and answered again. No
+legitimate dialog appears that fast — the child has to consume the answer, run
+the tool and repaint first — so the cooldown costs nothing real and removes a
+whole class of double-answer. Both the output path and the watchdog respect it.
 
 ## 9. Keys
 
