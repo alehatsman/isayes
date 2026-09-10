@@ -24,8 +24,6 @@ pub enum Hotkey {
     DelayUp,
     /// `Ctrl+Down` — one second less.
     DelayDown,
-    /// `Enter` — answer now, if a countdown is running.
-    Approve,
 }
 
 /// One complete thing read from stdin.
@@ -42,6 +40,17 @@ pub enum Unit {
 }
 
 impl Unit {
+    /// Is this the `Enter` key, in any encoding the child may have asked for?
+    ///
+    /// `Enter` is not a [`Hotkey`]: it belongs to the child except during a
+    /// countdown, and whether a countdown is running is engine state the
+    /// parser has no business knowing. So it stays a [`Unit::Key`] and the
+    /// engine asks.
+    #[must_use]
+    pub fn is_enter(&self) -> bool {
+        matches!(self, Self::Key(bytes) if is_enter(bytes))
+    }
+
     /// The bytes to forward to the child, if any.
     #[must_use]
     pub fn bytes(&self) -> Option<&[u8]> {
@@ -166,7 +175,6 @@ impl InputParser {
             // `Ctrl+A` as the terminal sends it when no keyboard protocol is
             // in play. Still the common case: Terminal.app implements neither.
             0x01 => Unit::Hotkey(Hotkey::Toggle),
-            b'\r' | b'\n' => Unit::Hotkey(Hotkey::Approve),
             _ => Unit::Key(vec![byte]),
         });
     }
@@ -230,6 +238,18 @@ impl InputParser {
     }
 }
 
+/// Is this the `Enter` key, in any encoding the child may have asked for?
+///
+/// Free rather than a method so the engine can ask before it consumes the
+/// bytes it is about to forward.
+#[must_use]
+pub fn is_enter(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"\r" | b"\n" | b"\x1b[13u" | b"\x1b[27;1;13~" | b"\x1b[27;5;13~"
+    )
+}
+
 /// Decide what a complete CSI sequence is. `seq` includes `ESC[` and the final.
 fn classify_csi(seq: Vec<u8>) -> Unit {
     let Some((&final_byte, rest)) = seq.split_last() else {
@@ -279,7 +299,6 @@ fn csi_hotkey(final_byte: u8, params: &[u16]) -> Option<Hotkey> {
             let ctrl = has_ctrl(params.get(1).copied());
             match code {
                 Some(97 | 65) if ctrl => Some(Hotkey::Toggle),
-                Some(13) => Some(Hotkey::Approve),
                 _ => None,
             }
         }
@@ -288,7 +307,6 @@ fn csi_hotkey(final_byte: u8, params: &[u16]) -> Option<Hotkey> {
             let ctrl = has_ctrl(params.get(1).copied());
             match params.first() {
                 Some(97 | 65) if ctrl => Some(Hotkey::Toggle),
-                Some(13) => Some(Hotkey::Approve),
                 _ => None,
             }
         }
@@ -360,12 +378,22 @@ mod tests {
         assert_eq!(one(b"\x1b[97;5u"), Unit::Hotkey(Hotkey::Toggle));
     }
 
+    /// Enter stays a key — it is the child's unless a countdown is running,
+    /// which the parser does not know about. `is_enter` is how the engine asks.
     #[test]
-    fn enter_in_every_encoding() {
-        assert_eq!(one(b"\r"), Unit::Hotkey(Hotkey::Approve));
-        assert_eq!(one(b"\n"), Unit::Hotkey(Hotkey::Approve));
-        assert_eq!(one(b"\x1b[13u"), Unit::Hotkey(Hotkey::Approve));
-        assert_eq!(one(b"\x1b[27;1;13~"), Unit::Hotkey(Hotkey::Approve));
+    fn enter_is_recognised_in_every_encoding_but_stays_a_key() {
+        for form in [
+            &b"\r"[..],
+            &b"\n"[..],
+            &b"\x1b[13u"[..],
+            &b"\x1b[27;1;13~"[..],
+        ] {
+            let unit = one(form);
+            assert!(unit.is_enter(), "{form:?} was not recognised as Enter");
+            assert!(unit.bytes().is_some(), "{form:?} must still be forwardable");
+        }
+        assert!(!one(b"a").is_enter());
+        assert!(!one(b"\x1b[A").is_enter());
     }
 
     #[test]
