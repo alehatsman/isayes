@@ -1,0 +1,49 @@
+#!/usr/bin/env expect
+# usage: capture.exp <logfile> <command> [args...]
+#
+# Start a program on a real PTY, log every byte it writes, and probe it with
+# the two resize cases that `docs/measurements.md` Q5 distinguishes:
+#
+#   a bare SIGWINCH, size unchanged  — what force_redraw()'s width toggle exists for
+#   an actual dimension change       — expected to repaint
+#
+# `sleep` does NOT drain a spawned process in expect: nothing reaches the log
+# while it runs, and the capture comes back empty. Draining has to be an expect
+# command that actually consumes output.
+
+proc drain {secs} {
+    set ::timeout $secs
+    expect {
+        -re {.+} { exp_continue }
+        timeout {}
+        eof {}
+    }
+}
+
+set logfile [lindex $argv 0]
+set cmd [lrange $argv 1 end]
+
+log_user 0
+log_file -noappend -a $logfile
+
+eval spawn -noecho $cmd
+set pid [exp_pid]
+set slave $spawn_out(slave,name)
+
+drain 6
+
+send_log "\n===A-BARE-WINCH===\n"
+catch { exec kill -WINCH $pid }
+drain 3
+
+send_log "\n===B-REAL-RESIZE===\n"
+catch { exec stty rows 30 columns 100 < $slave }
+drain 3
+
+send_log "\n===C-DONE===\n"
+send "\003"
+drain 1
+send "\003"
+drain 2
+catch { exec kill -TERM $pid }
+exit 0

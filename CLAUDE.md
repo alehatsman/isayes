@@ -4,8 +4,11 @@ A PTY wrapper for `claude` that answers its permission dialogs. Rust port of
 cry-aye (Go, at `~/projects/cry-aye` — the source of truth for behaviour and
 for the test corpus).
 
-**State: spec and seams done, wrapper not implemented.** `src/main.rs` is the
-CLI surface and a stub that exits 3.
+**State: detector, engine and the margin scanner are done and tested. The
+wrapper does not run yet** — `src/main.rs` is still the CLI surface and a stub
+that exits 3. What is missing is phase 1's raw mode, PTY, bar and teardown, and
+phase 4's wiring. Check `docs/plan.md` before writing anything: roughly 1 500
+lines already exist under `src/`.
 
 ## Read in this order
 
@@ -40,8 +43,10 @@ nothing while `~/.rustup/toolchains/*/bin/cargo` exists, and the fix is
 ## Non-negotiable
 
 - **The engine gets no I/O and no clock** (D8). `Instant::now()` belongs in
-  `events.rs` and nowhere else — `grep -rn 'Instant::now' src/` should show one
-  file. This is what keeps the test suite deterministic and sub-second.
+  `events.rs` and nowhere else — `grep -rn 'Instant::now' src/ | grep -v test` should
+  show only `events.rs`. (`engine.rs` has one documented origin helper inside
+  its `#[cfg(test)]` module; tests may read the clock, the loop may not.) This
+  is what keeps the test suite deterministic and sub-second.
 - **`unwrap`, `panic`, `todo!()` fail the gate** in non-test code. A stub that
   compiles green is worse than a red build.
 - **Do not hand-edit `clippy.toml`, `rustfmt.toml`, `deny.toml`,

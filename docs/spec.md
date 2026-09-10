@@ -201,9 +201,18 @@ Routing:
   outside the scroll region, so it cannot scroll.
 
 `ESC 7` / `ESC 8` (`DECSC`/`DECRC`) is a single-slot save per screen buffer,
-shared with the child. Ink does not use it, so today there is no conflict; a
-child that did would need the cursor tracked instead, which means parsing, and
-that is D7's rejected branch.
+shared with the child. **Measured 2026-09-10: the child does use it** — one
+pair, in the first eight bytes, wrapping its own margin reset. That is before
+the bar has anything to draw, so the collision risk is nil in practice, but the
+slot is shared and the earlier claim that Ink never touches it was wrong. A
+child that used it around a longer operation would need the cursor tracked
+instead, which means parsing, and that is D7's rejected branch.
+
+**The child destroys our margin on startup.** Its first act is
+`ESC 7  ESC[r  ESC 8` — a full-height `DECSTBM` reset. A margin set before
+spawning does not survive, so the startup order in §4 applies it *after* the
+child is running, and `MarginWatch` catches the reset if the timing slips.
+See [measurements.md](measurements.md).
 
 **Teardown restores the terminal**: `ESC[r` (full-height region), clear the
 status rows, restore termios. In that order, on every exit path — a leftover
@@ -221,9 +230,12 @@ Two reasons, both load-bearing:
   and skip the repaint after all.
 
 It is a poke at a child that will not repaint on request, and it is the ugliest
-thing in this spec. It stays until Claude Code offers something better, and it
-is a poke and not a corruption only because the scroll region holds the
-resulting reflow inside the child's rows.
+thing in this spec. **Measured 2026-09-10: it is also necessary.** A bare
+`SIGWINCH` with the size unchanged produced 2 bytes from the child; an actual
+dimension change produced 1 590 and a full repaint. There is no signal that
+makes it redraw without a real size change, so the toggle stays, and §11's idle
+rescue with it. It is a poke and not a corruption only because the scroll
+region holds the resulting reflow inside the child's rows.
 
 ## 8. Answering
 
@@ -268,12 +280,46 @@ forwarded to Claude.
 | `Ctrl+↑` | `ESC[1;5A` | no countdown | `delay + 1`, capped at 60. |
 | `Ctrl+↓` | `ESC[1;5B` | no countdown | `delay - 1`, floored at 0. |
 | `Enter` | `\r` \| `\n` | countdown | Answer now. |
-| any other | | countdown | Cancel the countdown. The keystroke is swallowed. |
+| any other **keystroke** | | countdown | Cancel the countdown. The keystroke is swallowed. |
 | any | | otherwise | Forwarded to the PTY verbatim. |
 
 An empty read is ignored. A cancel leaves the buffer intact, so the same dialog
 is re-detected on the next output or tick (§13 I9) — cancel is "not yet", not
 "never".
+
+### Stdin is not only keystrokes
+
+Measured 2026-09-10 (see [measurements.md](measurements.md)): on startup the
+child turns on focus reporting (`ESC[?1004h`), bracketed paste (`ESC[?2004h`)
+and theme notifications (`ESC[?2031h`), and it *queries* the terminal with
+Primary DA (`ESC[c`) and XTVERSION (`ESC[>0q`). Every one of those makes the
+terminal send bytes to **us**, because we own the tty, and none of them is a
+keypress:
+
+| Arrives | When |
+|---|---|
+| `ESC[I` / `ESC[O` | the window gains or loses focus |
+| `ESC[200~` … `ESC[201~` | around a paste |
+| `ESC[?…c`, a DCS version string | the child's queries being answered |
+| `ESC[?997;1n` | the OS theme changed |
+
+Two rules follow, and both are corrections rather than additions:
+
+1. **A terminal report is forwarded and does not cancel.** Treating it as "any
+   other key" swallows a reply the child is blocking on and cancels a countdown
+   for a reason the operator never caused. Clicking away from the window during
+   a countdown must not cancel the approval.
+2. **A hotkey is recognised in every encoding the child asked for.** The same
+   startup enables `modifyOtherKeys=2` (`ESC[>4;2m`) and the Kitty keyboard
+   protocol (`ESC[>1u`), so on a terminal that honours either, `Ctrl+A` arrives
+   as `ESC[27;5;97~` or `ESC[97;5u` — not as `0x01`. Matching only the raw byte
+   means the toggle silently does nothing on kitty, foot, WezTerm, iTerm2 and
+   recent xterm. It works in Terminal.app, which implements neither, which is
+   presumably why cry-aye never noticed.
+
+Both are D11. Neither is solvable by adding byte patterns to the table above:
+the wrapper has to know where an escape sequence *ends* before it can decide
+what the bytes were.
 
 ## 10. Status line
 
@@ -383,9 +429,11 @@ The properties the tests exist to hold. Each one has cost a bug once.
   way, and the whole suite runs in under a second — if it does not, something
   read the clock (D8).
 - **CLI** — `--delay` bounds, `--help`, `--` pass-through, exit codes.
-- **Terminal** — the margin logic is a pure function over a chunk of child
-  output (`needs_remargin(chunk) -> bool`) and a pure sequence builder
-  (`margin(height) -> Vec<u8>`), so I12 is unit-testable without a terminal:
+- **Terminal** — the margin logic is a pure sequence builder
+  (`margin(height) -> Vec<u8>`) and a pure scanner (`MarginWatch::feed`), so
+  I12 is unit-testable without a terminal. The scanner cannot be the free
+  function this section first specified: an escape splits across PTY reads at
+  any byte, so the carry has to live somewhere. Feed it:
   feed `ESC[?1049h`, `ESC[?1049l`, `ESC[1;40r`, `ESC[!p`, `ESC c`, a split
   escape across two chunks, and a plain paragraph, and assert the verdict.
   Teardown (I13) is asserted on the byte stream a `Drop` produces.

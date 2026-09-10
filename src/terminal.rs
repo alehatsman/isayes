@@ -5,9 +5,8 @@
 //! and must be re-applied. Both are pure, so [`crate::engine`]'s invariant I12
 //! is testable without a terminal.
 //!
-//! Raw mode, the PTY, the bar and teardown land once `docs/plan.md` task 1.0
-//! has answered what Claude Code actually does to the screen — see D7's
-//! overturn condition.
+//! Raw mode, the PTY, the bar and teardown are tasks 1.1/1.3/1.4. What the
+//! child actually does to the screen is measured in `docs/measurements.md`.
 
 /// Spec §7. The bottom rows the wrapper owns; Claude gets the rest.
 ///
@@ -22,6 +21,12 @@ pub const STATUS_ROWS: u16 = 1;
 /// the user's shell rendering into a box, which looks like the shell broke.
 pub const RESET_MARGIN: &[u8] = b"\x1b[r";
 
+/// A CSI carries at most this many parameter bytes before the rest are
+/// dropped. xterm caps the parameter *list* at 16; this caps the raw bytes,
+/// which is the same defence against an unterminated CSI in binary output
+/// growing a buffer without limit. Real sequences are a dozen bytes at most.
+const PARAM_CAP: usize = 64;
+
 /// `DECSTBM` for a terminal this tall — scrolling confined to
 /// `1 ..= height - STATUS_ROWS`.
 ///
@@ -30,11 +35,33 @@ pub const RESET_MARGIN: &[u8] = b"\x1b[r";
 /// the real terminal, and one scroll past the bottom takes the bar with it.
 /// That is the bug this port exists to fix (D7).
 ///
-/// Setting the region homes the cursor, so a redraw belongs after it.
+/// **Setting a region homes the cursor.** At startup that is free — the screen
+/// is being cleared anyway. Mid-stream it is not, which is what [`remargin`]
+/// is for.
 #[must_use]
 pub fn margin(height: u16) -> Vec<u8> {
     let bottom = height.saturating_sub(STATUS_ROWS).max(1);
     format!("\x1b[1;{bottom}r").into_bytes()
+}
+
+/// [`margin`] wrapped in `DECSC`/`DECRC`, for re-applying mid-stream.
+///
+/// The bare form homes the cursor, so re-asserting it in the middle of the
+/// child's paint would leave every subsequent byte landing at the top-left
+/// until the next repaint.
+///
+/// It costs sharing the terminal's single cursor-save slot with the child.
+/// Measured 2026-09-10: the child uses that slot exactly once, as an adjacent
+/// pair in its first eight bytes, so nothing of ours can land inside it. That
+/// is a measurement, not a guarantee — if `docs/measurements.md` stops saying
+/// it, this is the line that has to change.
+#[must_use]
+pub fn remargin(height: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(b"\x1b7");
+    out.extend_from_slice(&margin(height));
+    out.extend_from_slice(b"\x1b8");
+    out
 }
 
 /// Watches the child's output for anything that destroys the scroll region.
@@ -48,16 +75,23 @@ pub fn margin(height: u16) -> Vec<u8> {
 /// the carry: feed it 4 KiB at a time and a sequence straddling the boundary is
 /// still recognised.
 ///
-/// Known limit: the body of an OSC string is scanned as ordinary text, so an
-/// OSC payload that itself contained a `DECSTBM` would register. Nothing emits
-/// that, and the cost of being wrong is one redundant re-margin.
+/// Known limit: there is no string/OSC state, so the body of an OSC is scanned
+/// as ordinary text. An OSC payload containing a `DECSTBM`-shaped substring
+/// would register. Nothing emits that; the cost of being wrong is one
+/// [`remargin`], which is why that form exists rather than the bare one.
 #[derive(Debug, Default)]
 pub struct MarginWatch {
     state: State,
-    /// Parameter bytes of the CSI being read, `0x30..=0x3F`.
+    /// Parameter bytes of the CSI being read, `0x30..=0x3F`, capped.
     params: Vec<u8>,
-    /// Intermediate bytes, `0x20..=0x2F`. `!` is what makes `ESC[!p` a reset.
-    intermediates: Vec<u8>,
+    /// `?` — a private-mode sequence. `DECSTBM` is never private; `XTRESTORE`
+    /// (`CSI ? Pm r`) always is, and must not be mistaken for it.
+    private: bool,
+    /// `!` intermediate — what makes `p` a soft reset rather than anything else.
+    bang: bool,
+    /// Any other intermediate, e.g. `$` in `DECCARA` (`CSI … $ r`), which is
+    /// not a `DECSTBM` however much its final byte looks like one.
+    other_intermediate: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -76,27 +110,51 @@ impl MarginWatch {
     }
 
     /// Feed one chunk of child output. `true` if the scroll region is gone and
-    /// the caller must re-apply [`margin`].
+    /// the caller must re-apply [`remargin`].
     ///
     /// Reports at most once per chunk — the caller re-applies once either way,
-    /// and scanning the whole chunk keeps the machine's state correct for the
-    /// next one.
+    /// and the whole chunk is scanned regardless to keep the machine's state
+    /// correct for the next one.
+    ///
+    /// `#[must_use]`: dropping this verdict is a silent I12 failure with no
+    /// test and no compiler signal, and `must_use_candidate` is allowed
+    /// workspace-wide so nothing else would catch it.
+    #[must_use]
     pub fn feed(&mut self, chunk: &[u8]) -> bool {
         let mut clobbered = false;
-        for &byte in chunk {
+        let mut rest = chunk;
+        loop {
+            // In Ground the only interesting byte is ESC. Skipping to it beats
+            // a match arm per byte on a megabyte of build output, and this runs
+            // in the pass-through path.
+            if self.state == State::Ground {
+                let Some(offset) = rest.iter().position(|&b| b == 0x1B) else {
+                    break;
+                };
+                rest = rest.get(offset..).unwrap_or_default();
+            }
+            let Some((&byte, tail)) = rest.split_first() else {
+                break;
+            };
             clobbered |= self.step(byte);
+            rest = tail;
         }
         clobbered
     }
 
     fn step(&mut self, byte: u8) -> bool {
+        // ESC is unconditional in every state — a real terminal abandons
+        // whatever it was parsing and starts a new sequence. Without this, a
+        // truncated CSI followed by a real trigger (`ESC[38;5` then
+        // `ESC[?1049h`, routine in garbled tool output) is scanned as prose
+        // and missed.
+        if byte == 0x1B {
+            self.state = State::Escape;
+            return false;
+        }
+
         match self.state {
-            State::Ground => {
-                if byte == 0x1B {
-                    self.state = State::Escape;
-                }
-                false
-            }
+            State::Ground => false,
             State::Escape => match byte {
                 // RIS — a hard reset takes the margins with everything else.
                 b'c' => {
@@ -106,11 +164,11 @@ impl MarginWatch {
                 b'[' => {
                     self.state = State::Csi;
                     self.params.clear();
-                    self.intermediates.clear();
+                    self.private = false;
+                    self.bang = false;
+                    self.other_intermediate = false;
                     false
                 }
-                // A nested ESC restarts the sequence rather than aborting it.
-                0x1B => false,
                 _ => {
                     self.state = State::Ground;
                     false
@@ -123,42 +181,62 @@ impl MarginWatch {
     fn step_csi(&mut self, byte: u8) -> bool {
         match byte {
             0x30..=0x3F => {
-                self.params.push(byte);
+                if byte == b'?' && self.params.is_empty() {
+                    self.private = true;
+                } else if self.params.len() < PARAM_CAP {
+                    self.params.push(byte);
+                }
                 false
             }
             0x20..=0x2F => {
-                self.intermediates.push(byte);
+                if byte == b'!' {
+                    self.bang = true;
+                } else {
+                    self.other_intermediate = true;
+                }
                 false
             }
             0x40..=0x7E => {
                 self.state = State::Ground;
                 self.is_clobbering_final(byte)
             }
-            // Anything else aborts the sequence — that is what a real terminal
-            // does with a malformed CSI.
-            _ => {
-                self.state = State::Ground;
-                false
-            }
+            // C0 controls and DEL: a real terminal executes or ignores them and
+            // keeps parsing the sequence. Aborting here would miss
+            // `ESC[?1049\0h`, which NUL-padded or truncated output produces.
+            // ESC is already handled above, so this cannot wedge.
+            _ => false,
         }
     }
 
     fn is_clobbering_final(&self, final_byte: u8) -> bool {
         match final_byte {
-            // DECSTBM: the child set a region of its own, over ours.
-            b'r' => true,
-            // DECSET/DECRST 1049 — the alternate screen has its own margins.
-            b'h' | b'l' => self.params == b"?1049",
+            // DECSTBM. Not `CSI ? Pm r` (XTRESTORE) and not `CSI … $ r`
+            // (DECCARA) — both end in `r` and neither touches the margins.
+            b'r' => !self.private && !self.bang && !self.other_intermediate,
+            // DECSET/DECRST for an alternate screen, which has its own margins.
+            // Parameters are a `;`-separated list and a legal DECSET combines
+            // them — `ESC[?1049;1006h` enters the alt screen just as much as
+            // `ESC[?1049h` does — so this is membership, not equality. 1047
+            // and 47 are the older forms, still emitted by anything built
+            // against a termcap without 1049.
+            b'h' | b'l' => {
+                self.private
+                    && (self.has_param(b"1049") || self.has_param(b"1047") || self.has_param(b"47"))
+            }
             // DECSTR, a soft reset. `!` is the intermediate that identifies it.
-            b'p' => self.intermediates.contains(&b'!'),
+            b'p' => self.bang,
             _ => false,
         }
+    }
+
+    fn has_param(&self, want: &[u8]) -> bool {
+        self.params.split(|&b| b == b';').any(|p| p == want)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MarginWatch, RESET_MARGIN, STATUS_ROWS, margin};
+    use super::{MarginWatch, PARAM_CAP, RESET_MARGIN, STATUS_ROWS, margin, remargin};
 
     fn clobbers(chunks: &[&[u8]]) -> bool {
         let mut watch = MarginWatch::new();
@@ -172,7 +250,7 @@ mod tests {
     }
 
     /// A terminal too short to split still gets a valid region rather than
-    /// `ESC[1;0r`, which is a malformed sequence some terminals act on.
+    /// `ESC[1;0r`, which is malformed and which some terminals act on anyway.
     #[test]
     fn margin_never_emits_a_zero_row_region() {
         assert_eq!(margin(1), b"\x1b[1;1r");
@@ -185,38 +263,63 @@ mod tests {
         assert_eq!(RESET_MARGIN, b"\x1b[r");
     }
 
-    // ── the four triggers, spec §7 ───────────────────────────────────────────
-
+    /// Setting a region homes the cursor, so the mid-stream form has to put it
+    /// back or the child's next byte lands at the top-left.
     #[test]
-    fn entering_the_alternate_screen_clobbers_the_margin() {
-        assert!(clobbers(&[b"\x1b[?1049h"]));
+    fn remargin_restores_the_cursor_around_the_region() {
+        assert_eq!(remargin(24), b"\x1b7\x1b[1;23r\x1b8");
     }
 
+    // ── the triggers, spec §7 ────────────────────────────────────────────────
+
     #[test]
-    fn leaving_the_alternate_screen_clobbers_the_margin() {
+    fn entering_or_leaving_the_alternate_screen_clobbers_the_margin() {
+        assert!(clobbers(&[b"\x1b[?1049h"]));
         assert!(clobbers(&[b"\x1b[?1049l"]));
     }
 
+    /// A DECSET may carry several private modes at once and applies each. The
+    /// alt screen is entered either way, so membership is the test, not
+    /// equality against the whole parameter string.
     #[test]
-    fn the_child_setting_its_own_region_clobbers_the_margin() {
+    fn a_combined_decset_containing_1049_clobbers_the_margin() {
+        assert!(clobbers(&[b"\x1b[?1049;1006h"]));
+        assert!(clobbers(&[b"\x1b[?1006;1049h"]));
+        assert!(clobbers(&[b"\x1b[?25;1049;2004l"]));
+    }
+
+    /// The pre-1049 spellings. Anything built against an older termcap still
+    /// emits these, and §13 I12 does not qualify which sequence it means.
+    #[test]
+    fn the_legacy_alternate_screen_forms_clobber_the_margin() {
+        assert!(clobbers(&[b"\x1b[?1047h"]));
+        assert!(clobbers(&[b"\x1b[?47h"]));
+    }
+
+    /// Measured: this is Claude Code's first eight bytes, a full-height reset
+    /// wrapped in DECSC/DECRC. It destroys a margin set before the child
+    /// started, which is why §4 applies ours after.
+    #[test]
+    fn the_childs_startup_margin_reset_is_caught() {
+        assert!(clobbers(&[b"\x1b7\x1b[r\x1b8"]));
+    }
+
+    #[test]
+    fn the_child_setting_a_region_of_its_own_clobbers_the_margin() {
         assert!(clobbers(&[b"\x1b[1;40r"]));
-        assert!(clobbers(&[b"\x1b[r"]));
     }
 
     #[test]
-    fn a_soft_reset_clobbers_the_margin() {
+    fn a_soft_or_hard_reset_clobbers_the_margin() {
         assert!(clobbers(&[b"\x1b[!p"]));
-    }
-
-    #[test]
-    fn a_hard_reset_clobbers_the_margin() {
         assert!(clobbers(&[b"\x1bc"]));
     }
 
     // ── what must not fire ───────────────────────────────────────────────────
 
-    /// The overwhelming majority of what Claude emits. A false positive here
-    /// costs a redundant repaint on every colour change.
+    /// A false positive costs a `remargin` write in the middle of the child's
+    /// paint. Cheap, but not free, and on every colour change it would be
+    /// neither.
     #[test]
     fn ordinary_output_leaves_the_margin_alone() {
         assert!(!clobbers(&[b"Do you want to proceed?\n 1. Yes\n 2. No\n"]));
@@ -226,20 +329,36 @@ mod tests {
         assert!(!clobbers(&[b"\x1b]0;a title\x07"]), "OSC title");
     }
 
-    /// `?1049` is the alternate screen; `?1000` is mouse reporting and has
-    /// nothing to do with margins. The parameter has to be compared, not
-    /// searched for.
+    /// Everything else Claude Code turns on at startup, measured 2026-09-10.
+    /// None of it touches the margins and all of it is frequent.
     #[test]
-    fn other_private_modes_leave_the_margin_alone() {
-        assert!(!clobbers(&[b"\x1b[?1000h"]));
+    fn the_childs_other_startup_sequences_leave_the_margin_alone() {
         assert!(!clobbers(&[b"\x1b[?2004h"]), "bracketed paste");
-        assert!(!clobbers(&[b"\x1b[4h"]), "insert mode");
+        assert!(!clobbers(&[b"\x1b[?1004h"]), "focus reporting");
+        assert!(!clobbers(&[b"\x1b[?2031h"]), "theme notifications");
+        assert!(!clobbers(&[b"\x1b[>4;2m"]), "modifyOtherKeys");
+        assert!(!clobbers(&[b"\x1b[>1u\x1b[<u"]), "kitty keyboard");
+        assert!(!clobbers(&[b"\x1b[>0q"]), "XTVERSION query");
+        assert!(!clobbers(&[b"\x1b[c"]), "primary DA query");
     }
 
-    /// `p` is only a reset with the `!` intermediate. Bare `ESC[0p` is not.
     #[test]
-    fn p_without_the_bang_intermediate_is_not_a_reset() {
-        assert!(!clobbers(&[b"\x1b[0p"]));
+    fn other_private_modes_leave_the_margin_alone() {
+        assert!(!clobbers(&[b"\x1b[?1000h"]), "mouse reporting");
+        assert!(!clobbers(&[b"\x1b[4h"]), "insert mode");
+        // These contain the digits without being the modes.
+        assert!(!clobbers(&[b"\x1b[?10490h"]));
+        assert!(!clobbers(&[b"\x1b[?471h"]));
+    }
+
+    /// Three finals that look like triggers and are not: `p` without `!`,
+    /// `r` with the private marker (XTRESTORE), `r` with an intermediate
+    /// (DECCARA).
+    #[test]
+    fn near_miss_finals_leave_the_margin_alone() {
+        assert!(!clobbers(&[b"\x1b[0p"]), "p without the ! intermediate");
+        assert!(!clobbers(&[b"\x1b[?2r"]), "XTRESTORE, not DECSTBM");
+        assert!(!clobbers(&[b"\x1b[1;2;3;4$r"]), "DECCARA, not DECSTBM");
     }
 
     // ── split across reads ───────────────────────────────────────────────────
@@ -258,9 +377,50 @@ mod tests {
     /// Byte at a time is the worst case the boundary can produce.
     #[test]
     fn a_sequence_split_at_every_byte_is_still_caught() {
-        let seq = b"\x1b[?1049h";
-        let chunks: Vec<&[u8]> = seq.chunks(1).collect();
-        assert!(clobbers(&chunks));
+        for seq in [
+            &b"\x1b[?1049h"[..],
+            &b"\x1b[?1049;1006h"[..],
+            &b"\x1b[!p"[..],
+            &b"\x1b[1;40r"[..],
+            &b"\x1bc"[..],
+        ] {
+            let chunks: Vec<&[u8]> = seq.chunks(1).collect();
+            assert!(clobbers(&chunks), "missed {seq:?} split byte-at-a-time");
+        }
+    }
+
+    // ── robustness against garbage ───────────────────────────────────────────
+
+    /// A real terminal treats ESC as an unconditional restart. A truncated CSI
+    /// immediately followed by a trigger — routine when the child echoes
+    /// binary or half a frame — must not swallow the trigger.
+    #[test]
+    fn an_escape_inside_a_csi_restarts_the_sequence() {
+        assert!(clobbers(&[b"\x1b[38;5\x1b[?1049h"]));
+        assert!(clobbers(&[b"\x1b[1;2;3\x1bc"]));
+    }
+
+    /// C0 and DEL inside a CSI are executed or ignored by a real terminal,
+    /// which then keeps parsing. NUL padding and stray BEL are common in
+    /// truncated tool output.
+    #[test]
+    fn a_control_byte_inside_a_csi_does_not_abort_it() {
+        assert!(clobbers(&[b"\x1b[?1049\x00h"]));
+        assert!(clobbers(&[b"\x1b[?1049\x07h"]));
+        assert!(clobbers(&[b"\x1b[?1049\x7fh"]));
+    }
+
+    /// An unterminated CSI in binary output must not grow the parameter buffer
+    /// without limit inside a long-lived wrapper process.
+    #[test]
+    fn an_unterminated_csi_cannot_grow_the_parameter_buffer() {
+        let mut watch = MarginWatch::new();
+        let mut garbage = vec![0x1B, b'['];
+        garbage.extend(std::iter::repeat_n(b'1', 10_000));
+        assert!(!watch.feed(&garbage));
+        assert!(watch.params.len() <= PARAM_CAP);
+        // And it still works afterwards.
+        assert!(watch.feed(b"\x1b[?1049h"));
     }
 
     /// The machine must not stay armed after a sequence ends, or the next
@@ -275,9 +435,16 @@ mod tests {
     #[test]
     fn a_malformed_sequence_does_not_wedge_the_scanner() {
         let mut watch = MarginWatch::new();
-        // ESC followed by something that starts nothing.
         assert!(!watch.feed(b"\x1bZ"));
-        // The scanner still works afterwards.
         assert!(watch.feed(b"\x1b[?1049h"));
+    }
+
+    /// The whole chunk is scanned, not abandoned at the first hit, so state is
+    /// correct for the next one.
+    #[test]
+    fn a_trigger_after_a_trigger_in_one_chunk_leaves_ground_state() {
+        let mut watch = MarginWatch::new();
+        assert!(watch.feed(b"\x1b[?1049h text \x1b[!p more"));
+        assert!(!watch.feed(b"plain"));
     }
 }
