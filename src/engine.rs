@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::detector;
 use crate::events::Event;
+use crate::input::{self, Hotkey, InputParser, Unit};
 
 /// Spec §5. Bytes past this are dropped from the front.
 const BUFFER_CAP: usize = 10_000;
@@ -27,12 +28,6 @@ const RESCUE_COOLDOWN: Duration = Duration::from_secs(3);
 const FLASH: Duration = Duration::from_millis(800);
 const FLASH_CANCEL: Duration = Duration::from_millis(500);
 const FLASH_ERROR: Duration = Duration::from_secs(1);
-
-/// Spec §9. `Ctrl+A`.
-const CTRL_A: u8 = 0x01;
-/// Spec §9. `Ctrl+Up` / `Ctrl+Down`.
-const CTRL_UP: &[u8] = b"\x1b[1;5A";
-const CTRL_DOWN: &[u8] = b"\x1b[1;5B";
 
 /// Spec §3. `--delay` is clamped to this by the CLI; the keys respect it too.
 const MAX_DELAY: u8 = 60;
@@ -89,6 +84,10 @@ pub struct Engine {
     countdown: Option<Countdown>,
     approvals: u32,
     flash: Option<Flash>,
+    /// Splits stdin into units before §9's rules are applied (D11). Raw byte
+    /// matching cannot see a `Ctrl+A` the terminal encoded, and cannot tell a
+    /// focus event from a keypress.
+    input: InputParser,
     last_output: Instant,
     /// `None` until the first rescue. Seeding it with the start time would be
     /// claiming a rescue that never happened, and would hold the first real one
@@ -107,6 +106,7 @@ impl Engine {
             countdown: None,
             approvals: 0,
             flash: None,
+            input: InputParser::new(),
             last_output: started,
             last_rescue: None,
         }
@@ -153,39 +153,81 @@ impl Engine {
     }
 
     fn on_input(&mut self, bytes: &[u8], now: Instant) -> Vec<Action> {
-        let Some(&first) = bytes.first() else {
-            return Vec::new();
-        };
+        let units = self.input.feed(bytes);
+        self.handle_units(units, now)
+    }
 
-        if bytes.len() == 1 && first == CTRL_A {
-            return self.toggle(now);
-        }
-
-        if self.countdown.is_none() {
-            if bytes.starts_with(CTRL_UP) {
-                return self.change_delay(true, now);
+    fn handle_units(&mut self, units: Vec<Unit>, now: Instant) -> Vec<Action> {
+        let mut actions: Vec<Action> = Vec::new();
+        for unit in units {
+            for action in self.handle_unit(unit, now) {
+                // Adjacent forwards are merged. The parser yields a unit per
+                // keystroke, so without this a 10 KiB paste would be 10 240
+                // writes to the PTY. The byte stream the child sees is
+                // identical either way; the syscall count is not.
+                if let Action::Forward(more) = action {
+                    if let Some(Action::Forward(accumulated)) = actions.last_mut() {
+                        accumulated.extend_from_slice(&more);
+                    } else {
+                        actions.push(Action::Forward(more));
+                    }
+                } else {
+                    actions.push(action);
+                }
             }
-            if bytes.starts_with(CTRL_DOWN) {
-                return self.change_delay(false, now);
+        }
+        actions
+    }
+
+    /// Spec §9, once the bytes have been resolved into something meaningful.
+    fn handle_unit(&mut self, unit: Unit, now: Instant) -> Vec<Action> {
+        match unit {
+            Unit::Hotkey(Hotkey::Toggle) => self.toggle(now),
+            Unit::Hotkey(key) if self.countdown.is_none() => {
+                self.change_delay(matches!(key, Hotkey::DelayUp), now)
+            }
+            // The delay keys do not apply during a countdown, and a deliberate
+            // keypress there means "not this one" (§9).
+            Unit::Hotkey(_) => self.cancel(now),
+
+            // Not a keypress at all: a focus event, a paste marker, a reply to
+            // something the child asked. Forwarded, and never a cancel — this
+            // is the whole point of D11. Treating it as "any other key" kills
+            // an approval because the operator clicked another window, and
+            // eats a reply the child is blocking on.
+            Unit::Report(bytes) => vec![Action::Forward(bytes)],
+
+            Unit::Key(bytes) => {
+                if self.countdown.is_none() {
+                    // Enter included: it is the child's unless we are asking.
+                    return vec![Action::Forward(bytes)];
+                }
+                if input::is_enter(&bytes) {
+                    self.answer(now)
+                } else {
+                    // Swallowed, not forwarded (§9). The buffer is left intact
+                    // so the same dialog is re-detected: cancel means "not
+                    // yet", not "never" (§13 I9).
+                    self.cancel(now)
+                }
             }
         }
+    }
 
-        if self.countdown.is_some() {
-            if first == b'\r' || first == b'\n' {
-                return self.answer(now);
-            }
-            // Any other key cancels — and is swallowed, not forwarded (§9).
-            // The buffer is left intact so the same dialog is re-detected:
-            // cancel means "not yet", not "never" (§13 I9).
-            self.countdown = None;
-            return self.flash("✗ Cancelled", "90", now, FLASH_CANCEL);
-        }
-
-        vec![Action::Forward(bytes.to_vec())]
+    fn cancel(&mut self, now: Instant) -> Vec<Action> {
+        self.countdown = None;
+        self.flash("✗ Cancelled", "90", now, FLASH_CANCEL)
     }
 
     fn on_tick(&mut self, now: Instant) -> Vec<Action> {
         let mut actions = Vec::new();
+
+        // A lone `ESC` is indistinguishable from the start of `ESC[A` until
+        // more bytes arrive or they do not. The tick is what says they did not.
+        if self.input.is_pending() {
+            let held = self.input.flush();
+            actions.extend(self.handle_units(held, now));
+        }
 
         if self.countdown.is_some_and(|c| now >= c.ends_at) {
             actions.extend(self.answer(now));
@@ -373,8 +415,12 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, CTRL_A, CTRL_DOWN, CTRL_UP, Engine};
+    use super::{Action, Engine};
     use crate::events::Event;
+
+    const CTRL_A: &[u8] = b"\x01";
+    const CTRL_UP: &[u8] = b"\x1b[1;5A";
+    const CTRL_DOWN: &[u8] = b"\x1b[1;5B";
     use std::time::{Duration, Instant};
 
     /// The corpus's `loop harness canonical` entry, verbatim. Both suites use
@@ -452,7 +498,7 @@ mod tests {
     fn i3_nothing_is_answered_while_auto_approve_is_off() {
         let t0 = origin();
         let mut e = Engine::new(0, t0);
-        e.handle(Event::Input(vec![CTRL_A], at(t0, 1)));
+        e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
 
         assert_eq!(n_answers(&out(&mut e, t0, 2, DIALOG)), 0);
         assert_eq!(n_answers(&ticks(&mut e, t0, 200, 50)), 0);
@@ -655,11 +701,101 @@ mod tests {
     // ── keys, §9 ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn ordinary_keystrokes_are_forwarded_verbatim() {
+    fn ordinary_keystrokes_are_forwarded_verbatim_in_one_write() {
         let t0 = origin();
         let mut e = Engine::new(0, t0);
         let actions = e.handle(Event::Input(b"ls -la\r".to_vec(), at(t0, 1)));
         assert_eq!(actions, vec![Action::Forward(b"ls -la\r".to_vec())]);
+    }
+
+    /// A paste arrives bracketed. The markers are reports and the content is
+    /// keys, and all of it reaches the child as one write in the original
+    /// order — 10 KiB of paste must not become 10 240 syscalls.
+    #[test]
+    fn a_bracketed_paste_is_forwarded_as_one_write() {
+        let t0 = origin();
+        let mut e = Engine::new(0, t0);
+        let actions = e.handle(Event::Input(b"\x1b[200~hello\x1b[201~".to_vec(), at(t0, 1)));
+        assert_eq!(
+            actions,
+            vec![Action::Forward(b"\x1b[200~hello\x1b[201~".to_vec())]
+        );
+    }
+
+    // ── D11: what the measurement found ──────────────────────────────────────
+
+    /// The sharp one. Clicking away from the terminal during a countdown must
+    /// not cancel the approval, and the event still has to reach the child.
+    #[test]
+    fn a_focus_event_during_a_countdown_does_not_cancel_it() {
+        let t0 = origin();
+        let mut e = Engine::new(5, t0);
+        assert_eq!(n_answers(&out(&mut e, t0, 1, DIALOG)), 0);
+
+        let actions = e.handle(Event::Input(b"\x1b[O".to_vec(), at(t0, 50)));
+        assert_eq!(actions, vec![Action::Forward(b"\x1b[O".to_vec())]);
+
+        // Still armed: it answers when the countdown expires.
+        assert_eq!(n_answers(&ticks(&mut e, t0, 5_200, 2)), 1);
+    }
+
+    /// A reply to a query the child made. Swallowing it leaves the child
+    /// waiting for an answer that never comes.
+    #[test]
+    fn a_query_reply_during_a_countdown_is_forwarded_and_does_not_cancel() {
+        let t0 = origin();
+        let mut e = Engine::new(5, t0);
+        out(&mut e, t0, 1, DIALOG);
+
+        let actions = e.handle(Event::Input(b"\x1b[?62;1;6c".to_vec(), at(t0, 50)));
+        assert_eq!(actions, vec![Action::Forward(b"\x1b[?62;1;6c".to_vec())]);
+        assert_eq!(n_answers(&ticks(&mut e, t0, 5_200, 2)), 1);
+    }
+
+    /// Ctrl+A as a terminal honouring modifyOtherKeys=2 sends it. Before D11
+    /// this was seven ordinary keystrokes.
+    #[test]
+    fn ctrl_a_toggles_in_the_encoded_forms_too() {
+        let t0 = origin();
+        for form in [&b"\x1b[27;5;97~"[..], &b"\x1b[97;5u"[..]] {
+            let mut e = Engine::new(0, t0);
+            let actions = e.handle(Event::Input(form.to_vec(), at(t0, 1)));
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Forward(_))),
+                "{form:?} was forwarded instead of consumed"
+            );
+            // Auto-approve is now off, so a dialog goes unanswered.
+            assert_eq!(n_answers(&out(&mut e, t0, 2, DIALOG)), 0);
+        }
+    }
+
+    /// Enter belongs to the child when nothing is pending.
+    #[test]
+    fn enter_without_a_countdown_reaches_the_child() {
+        let t0 = origin();
+        let mut e = Engine::new(0, t0);
+        let actions = e.handle(Event::Input(b"\r".to_vec(), at(t0, 1)));
+        assert_eq!(actions, vec![Action::Forward(b"\r".to_vec())]);
+    }
+
+    /// A lone ESC is held until the tick says no more bytes are coming, then
+    /// resolves as the keystroke it was — cancelling, like any other key.
+    #[test]
+    fn a_lone_escape_is_resolved_on_the_next_tick() {
+        let t0 = origin();
+        let mut e = Engine::new(5, t0);
+        out(&mut e, t0, 1, DIALOG);
+
+        assert!(
+            e.handle(Event::Input(b"\x1b".to_vec(), at(t0, 50)))
+                .is_empty()
+        );
+        let tick = e.handle(Event::Tick(at(t0, 200)));
+        assert!(
+            tick.iter()
+                .any(|a| matches!(a, Action::Status { colour: "90", .. })),
+            "the held ESC did not resolve into a cancel: {tick:?}"
+        );
     }
 
     #[test]
@@ -673,7 +809,7 @@ mod tests {
     fn ctrl_a_is_never_forwarded() {
         let t0 = origin();
         let mut e = Engine::new(0, t0);
-        let actions = e.handle(Event::Input(vec![CTRL_A], at(t0, 1)));
+        let actions = e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
         assert!(!actions.iter().any(|a| matches!(a, Action::Forward(_))));
     }
 
@@ -727,12 +863,12 @@ mod tests {
         let t0 = origin();
         let mut e = Engine::new(0, t0);
 
-        e.handle(Event::Input(vec![CTRL_A], at(t0, 1)));
+        e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
         assert_eq!(n_answers(&out(&mut e, t0, 2, DIALOG)), 0);
 
         // Re-enabling arms it; the next tick fires it.
         assert_eq!(
-            n_answers(&e.handle(Event::Input(vec![CTRL_A], at(t0, 3)))),
+            n_answers(&e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 3)))),
             0
         );
         assert_eq!(n_answers(&ticks(&mut e, t0, 200, 1)), 1);
@@ -763,7 +899,7 @@ mod tests {
     fn the_bar_says_off_when_it_is_off() {
         let t0 = origin();
         let mut e = Engine::new(7, t0);
-        e.handle(Event::Input(vec![CTRL_A], at(t0, 1)));
+        e.handle(Event::Input(CTRL_A.to_vec(), at(t0, 1)));
 
         // Past the flash, the steady text returns.
         let actions = ticks(&mut e, t0, 2_000, 1);

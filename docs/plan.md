@@ -19,7 +19,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 | 1 — terminal | `feat/terminal` | the four abuses below | 1.0, 1.2 done; 1.1, 1.3–1.5 open |
 | 2 — detector | `feat/detector` | 27 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
-| 3b — input (D11) | `feat/input` | hotkeys in all three encodings; reports never cancel | parser done; engine not yet wired |
+| 3b — input (D11) | `feat/input` | hotkeys in all three encodings; reports never cancel | done |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
 
 **1 and 2 are parallel.** They share no file. 3 needs only `detector`'s
@@ -220,28 +220,26 @@ second. If it takes longer than that, a clock got read somewhere (D8).
 
 ## Phase 3b — the input parser (D11)
 
-`input.rs`. Spec §9, decision D11. **Parser done; the engine does not use it
-yet.**
+`input.rs`. Spec §9, decision D11. **Done.**
 
 New scope, created by the 1.0 measurement rather than planned. 21 tests:
 `Ctrl+A` in all three encodings, focus events and query replies as reports,
 paste markers around a paste, sequences split at every byte, the lone-`Esc`
 hold-and-flush, and the bounded recovery from an unterminated string sequence.
 
-### 3b.1 — Wire it into the engine — **open**
+### 3b.1 — Wire it into the engine — **done**
 
-`Engine::on_input` still matches raw bytes. It should take `Vec<Unit>` and act
-on the classification:
+`Engine` owns the parser; `on_input` feeds it and acts on the classification,
+and the tick calls `flush` so a lone `Esc` resolves a read late.
 
-- `Unit::Hotkey` — §9's four actions. Never forwarded.
-- `Unit::Key` — forwarded; cancels a running countdown.
-- `Unit::Report` — forwarded; **never** cancels.
+Two things fell out of wiring it:
 
-`InputParser::flush` needs a caller: a lone `Esc` is held until something says
-no more bytes are coming, and the 200 ms tick is that something.
-
-**Done when:** an engine test proves a focus event arriving mid-countdown does
-not cancel it, and that `ESC[27;5;97~` toggles auto-approve.
+- **`Enter` is not a `Hotkey`.** It belongs to the child except while a
+  countdown is running, and that is engine state the parser has no business
+  knowing. It stays a `Unit::Key`; `input::is_enter` is how the engine asks.
+- **Adjacent `Forward`s are coalesced.** The parser yields one unit per
+  keystroke, so without merging, a 10 KiB paste would be 10 240 writes to the
+  PTY. The bytes the child sees are identical; the syscall count is not.
 
 ## Phase 4 — wiring and cut-over
 
