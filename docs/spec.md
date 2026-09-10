@@ -67,12 +67,18 @@ outside the loop:
 
 Startup order, each step failing the process (§12) rather than degrading:
 
-1. Size the PTY from the real terminal: `rows = height - 1` (floor 1),
-   `cols = width`. The reserved row is §7.
+1. Size the PTY from the real terminal: `rows = height - STATUS_ROWS`
+   (floor 1), `cols = width`. The reserved rows are §7.
 2. Spawn `claude` with the pass-through args on the PTY.
 3. Put stdin in raw mode.
-4. Clear the screen (`ESC[2J ESC[H`), draw the status line.
+4. Clear the screen (`ESC[2J ESC[H`), apply the scroll region, draw the bar.
 5. Start the producers, enter the loop.
+
+The margin goes on **after** the child is spawned, and even that is not enough
+on its own: the child's own first act is a full-height `DECSTBM` reset
+(measured — §7), which arrives asynchronously and will destroy whatever we set.
+`MarginWatch` catching that reset is not a defensive nicety, it is the
+mechanism by which the margin exists at all.
 
 Teardown is one idempotent `cleanup`: restore the termios state, close the PTY,
 kill the child, flush the debug log. It runs on every exit path including
