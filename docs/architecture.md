@@ -104,14 +104,29 @@ impl Drop for Terminal { /* full-height region, clear bar, restore termios */ }
 Two pure functions carry the parts worth testing, so I12 needs no terminal:
 
 ```rust
-/// Did this chunk contain something that clears the scroll region? §7.
-pub fn needs_remargin(chunk: &[u8]) -> bool;
 /// The DECSTBM sequence for a terminal this tall.
 pub fn margin(height: u16) -> Vec<u8>;
+/// DECSTBM restoring the full height. Teardown writes it. §13 I13.
+pub const RESET_MARGIN: &[u8];
+
+/// Watches child output for anything that clears the scroll region. §7.
+pub struct MarginWatch { /* … */ }
+impl MarginWatch {
+    pub fn new() -> Self;
+    pub fn feed(&mut self, chunk: &[u8]) -> bool;
+}
 ```
 
-`needs_remargin` must handle an escape split across two chunks. It is a scanner
-with carry-over state, not a `contains`.
+`needs_remargin` was drafted as a free function. It cannot be one: an escape
+sequence splits across PTY reads at any byte, so the carry has to live
+somewhere. It is a four-state machine over bytes — ground, escape, CSI, with
+parameter and intermediate buffers — and the machine *is* the carry, so no
+lookback buffer is needed and a sequence delivered one byte at a time is still
+recognised.
+
+Comparing the CSI parameters matters: `?1049h` is the alternate screen,
+`?1000h` is mouse reporting, and `p` is only a soft reset with the `!`
+intermediate. A `contains` over the chunk gets all three wrong.
 
 ### `events.rs` — phase 1
 

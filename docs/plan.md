@@ -16,7 +16,7 @@ the repo. Conventional commits. A task is done when its **done-when** holds
 | Phase | Branch | Gate | State |
 |---|---|---|---|
 | 0 — scaffold, spec, seams | `main` | seven tasks validate; gate green; corpus verified | done |
-| 1 — terminal | `feat/terminal` | the four abuses below | open |
+| 1 — terminal | `feat/terminal` | the four abuses below | 1.2 done; 1.0–1.5 open |
 | 2 — detector | `feat/detector` | 27 corpus cases green | done |
 | 3 — engine | `feat/engine` | I1–I11 asserted, no sleeps | done |
 | 4 — wiring, cut-over | `feat/wire` | a real day's work under it | open, owner's |
@@ -57,15 +57,20 @@ mode on stdin. `Drop` restores termios.
 **Done when:** `isayes` runs `claude` and it is usable — typing works, output
 appears, `Ctrl+C` reaches the child. No bar yet.
 
-### 1.2 — The margin
+### 1.2 — The margin — **done**
 
-`margin(height)`, `needs_remargin(chunk)`, applied at startup and re-applied on
-every trigger in §7's table. `needs_remargin` carries state across chunk
-boundaries — an escape split across two reads still counts.
+`margin(height)`, `RESET_MARGIN`, and `MarginWatch` — the sequences and the
+scanner that says when the region has been destroyed. All pure, so this half of
+I12 needed no terminal and no measurement: the trigger list is fixed VT
+semantics regardless of what 1.0 finds about Claude.
 
-**Done when:** both pure functions are unit-tested against `ESC[?1049h`,
-`ESC[?1049l`, `ESC[1;40r`, `ESC[!p`, `ESC c`, an escape split across two
-chunks, and a plain paragraph. That is I12 without a terminal.
+15 tests. Every trigger in §7's table, every split-point including byte-at-a-
+time, and the false positives that would cost a repaint on every colour change
+— `?1000h`, `?2004h`, bare `ESC[0p`, OSC titles, cursor moves, SGR.
+
+`needs_remargin` became `MarginWatch::feed`; it cannot be a free function
+(architecture.md says why). Applying it at startup and on each trigger is
+1.1/1.4's job.
 
 ### 1.3 — The bar
 

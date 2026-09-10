@@ -7,3 +7,4 @@
 pub mod detector;
 pub mod engine;
 pub mod events;
+pub mod terminal;
