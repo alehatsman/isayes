@@ -91,7 +91,7 @@ missing_panics_doc = "allow"         # panics are bugs (M-PANIC-ON-BUG), not API
 cast_precision_loss = "allow"        # u64 -> f64 is almost always intended
 struct_excessive_bools = "allow"     # config structs legitimately have flags
 similar_names = "allow"              # flags `src`/`dst`
-too_many_lines = "allow"             # budget-status.sh owns the LOC ratchet
+too_many_lines = "warn"              # 200-line cap, see clippy.toml
 implicit_hasher = "allow"            # forces a generic param on every pub HashMap fn
 unnecessary_debug_formatting = "allow" # `{:?}` on Path is the readable choice
 
@@ -130,6 +130,8 @@ cognitive_complexity = "warn"
 clone_on_ref_ptr = "warn"            # `Arc::clone(&x)` says what it costs
 rc_mutex = "warn"                    # `Rc<Mutex<_>>` is a design error
 dbg_macro = "warn"
+exit = "warn"                        # `process::exit` skips every destructor
+infinite_loop = "warn"               # `loop` with no `break` in a fn that returns
 
 # Lint suppression is itself reviewable (M-LINT-OVERRIDE-EXPECT).
 allow_attributes = "warn"                # use `#[expect]`: it warns once it's stale

@@ -19,10 +19,16 @@ allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
 allow-print-in-tests = true
 
-# Soft caps. These are the clippy-side twins of scripts/budget-status.sh —
-# keep them in sync with CAP_COGNITIVE if you move one.
+# Soft caps, enforced by clippy at lint time — no second tool and no second
+# compile. `too-many-lines-threshold` is the function-scope twin of CAP_LOC in
+# scripts/lib.sh, which is file-scope; both count code lines, not bytes.
+#
+# `too_many_lines` was previously allowed in lints.toml and credited to a
+# `scripts/budget-status.sh` that does not exist and never did, so function
+# length was enforced by nothing at all.
 cognitive-complexity-threshold = 30
 too-many-arguments-threshold = 8
+too-many-lines-threshold = 200
 type-complexity-threshold = 500
 
 # `doc_markdown` (pedantic) is on. `..` extends clippy's default list rather

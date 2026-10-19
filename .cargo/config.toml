@@ -2,7 +2,7 @@
 #
 # Cargo has a first-class mechanism for named commands, so the everyday ones
 # live here rather than in a task runner: they work in a terminal, in CI, and in
-# an editor, with no mooncake, no module fetch and no YAML.
+# an editor, with no provision, no checkout and no YAML.
 #
 # Presets are reserved for what an alias cannot do: multi-step gates with
 # fail-fast ordering, and copying config into a consumer repo.
@@ -10,7 +10,9 @@
 [alias]
 lint = "clippy --locked --all-targets --all-features -- -D warnings"
 # nextest never runs doctests. Two aliases rather than one that quietly skips.
-t = "nextest run --locked --workspace --all-features"
+# `--no-tests=warn` because nextest defaults to `fail`, and a crate whose only
+# tests are doctests would otherwise have `cargo t` fail on every run.
+t = "nextest run --no-tests=warn --locked --workspace --all-features"
 doctest = "test --locked --doc --workspace --all-features"
 docs = "doc --locked --no-deps --workspace --all-features"
 
