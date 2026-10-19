@@ -7,7 +7,7 @@ steps:
   # `vars`, not a prop default: a prop's default is taken as written and never
   # rendered, so `{{ home }}` in one would stay four braces.
   - vars:
-      rq_ref: v0.3.0
+      rq_ref: v0.6.0
       rq_dir: "{{ home }}/.cache/provision/tools/rust-quality"
 
   - name: "rust-quality at {{ rq_ref }}"
