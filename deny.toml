@@ -50,6 +50,12 @@ allow = [
   "CC0-1.0",
   "Unlicense",
   "BSL-1.0",
+  # The Mozilla CA bundle (`webpki-roots`, `webpki-root-certs`) ships under a
+  # permissive *data* licence, not a code one. Every Rust TLS stack that
+  # verifies a public certificate pulls it in, so the real choice here is this
+  # entry or no TLS roots -- and CDLA-Permissive-2.0 grants use and
+  # redistribution without conditions on the using work.
+  "CDLA-Permissive-2.0",
 ]
 
 [sources]
